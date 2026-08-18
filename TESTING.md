@@ -59,18 +59,18 @@ Email 走与 iMessage 相同的 M1–M16 清单，额外注意：
 
 > 「尽量沿用成熟实现」的落实：每个通道的实现来源都明确标注，新增通道优先移植下列成熟仓库。
 >
-> **状态说明**：`✅ 端到端验收` = 作者已在真实通道上跑通完整闭环（收发回执 + 诉求应答）；`⚠️ 部分验证` = 核心链路已通、个别环节待补；`预留接口` = 未实现，欢迎社区按 `src/channels/types.js` 契约接入。
+> **状态说明**：`✅ 端到端验收` = 作者已在真实通道上跑通完整闭环（收发回执 + 诉求应答 + 回信匹配）；`预留接口` = 未实现，欢迎社区按 `src/channels/types.js` 契约接入。
 
 | 通道 | 实现 | 成熟来源 | 状态 |
 |---|---|---|---|
 | **iMessage** | AppleScript 发送 + chat.db 轮询（attributedBody 提取） | 自研（macOS 26 移除了消息类脚本，chat.db 是唯一可靠收信途径）；模式沿用 im-bridge 的桥接/去重/游标设计 | ✅ **端到端验收**（收发回执 + 诉求 #N 应答闭环 + 已读标注本地生效） |
 | **WeChat** | iLink 扫码登录 + 长轮询 | [dsh-im-bridge](https://github.com/BiBoyang/dsh-im-bridge)（MIT）`src/ilink.ts` 逐行移植 | ✅ **端到端验收**（扫码绑定 → 收信 → 路由 → 回执，全链路走通） |
-| **Email** | imapflow（IMAP）+ nodemailer（SMTP）+ mailparser（MIME） | 业界标准 Node 库（多数 DSH 邮件插件的同一栈）；SPF/DKIM/DMARC 校验、In-Reply-To 编号回填 | ⚠️ 部分验证（IMAP/SMTP 收发 + 认证校验已通；**回信闭环待用户回复测试邮件补验**） |
+| **Email** | imapflow（IMAP）+ nodemailer（SMTP）+ mailparser（MIME） | 业界标准 Node 库（多数 DSH 邮件插件的同一栈）；SPF/DKIM/DMARC 校验、In-Reply-To 编号回填 | ✅ **端到端验收**（IMAP 轮询收信 + SMTP 发送 + 认证校验 + **回信闭环**：Gmail 回复 → In-Reply-To 补编号 → 插件收信应答，全链路走通） |
 | **Telegram** | Bot API 长轮询（待接入） | [LoserFox/telegram](https://github.com/LoserFox/telegram)（源自 Hermes 适配器：getUpdates/sendMessage/HTML 分段/用户白名单） | 🔧 预留接口，**待社区实现** |
 | **飞书/Lark** | 卡片交互（待接入） | [imetn/dsh-lark-bridge](https://github.com/imetn/dsh-lark-bridge)（WebSocket 长连接、卡片审批/提问） | 🔧 预留接口，**待社区实现** |
 | **钉钉** | 待接入 | 参照 im-bridge 通道层契约 | 🔧 预留接口，**待社区实现** |
 
-**邀请社区贡献**：Telegram / 飞书 / 钉钉 尚未实现，按 `src/channels/types.js` 契约实现 `configured/start/stop/send/isTrusted/status` + 接入 `pushInbound` 即可；也欢迎为 Email 回信闭环、各通道 E2E 验收补充验证记录（见下方贡献流程）。
+**邀请社区贡献**：Telegram / 飞书 / 钉钉 尚未实现，按 `src/channels/types.js` 契约实现 `configured/start/stop/send/isTrusted/status` + 接入 `pushInbound` 即可；也欢迎为各通道在更多平台上的 E2E 验收补充验证记录（见下方贡献流程）。
 
 通道契约见 `src/channels/types.js`（`configured/start/stop/send/isTrusted/status` + `pushInbound`）。
 
