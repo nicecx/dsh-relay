@@ -1,5 +1,7 @@
 # dsh-relay
 
+> 🚀 **欢迎贡献！** 本项目把"诉求中转"做成通用框架：**iMessage / Email / 微信 三个通道已端到端验收**，**Telegram / 飞书 / 钉钉 等待你来实现**——按 `src/channels/types.js` 的通道契约接入即可，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。所有贡献需通过测试套件（见 [TESTING.md](TESTING.md)）。
+
 DSH（DeepSeek Harness）宿主级插件：**把需要你授权或提供开发建议的诉求，按编号推送到 iMessage / Email / 微信等可配置通道，在通道里直接批准、拒绝或回答；功能开关与启用范围也全部通过通道消息配置。** 跨会话共享（装在 profile 层，所有对话通用）。
 
 架构基于成熟的 [dsh-im-bridge](https://github.com/BiBoyang/dsh-im-bridge)（MIT）扩展：通道层与桥接层分离、持久去重、长回复分段、`..`/`!!` 合并窗口均沿用其实现；编号审批应答参考 [dsh-chatnode-wechat](https://github.com/Jesse-njx/dsh-chatnode-wechat)。并修正了上游在 web profile 中的两个关键问题：
