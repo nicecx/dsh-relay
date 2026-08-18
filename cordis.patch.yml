@@ -1,0 +1,70 @@
+# dsh-relay bundle patch: 把本插件插进 profile 层栈（宿主级，跨会话共享）。
+# 关键实现点：approval/request 与 tools/execute 监听均使用 { prepend: true }，
+# 排在 api-proxy（网页答案器）之前，超时/未启用时 next() 转回网页 UI。
+#
+# ⚠️ 个人信息（iMessage 句柄、邮箱账号等）不要写进本文件——本文件会随仓库发布。
+# 在 profile 的 cordis.patch.yml（~/.dsh/profiles/<name>/cordis.patch.yml，机器本地）
+# 里用同 id 行覆盖 config（行 config 为整体替换语义），示例见 README.md。
+- insert:
+    - id: dsh-relay
+      name: 'dsh-relay'
+      config:
+        enabled: true
+        # 会话范围（可选）：allSessions=false 时只对 sessionOverrides 里列出的会话
+        # 推送诉求/通知；不提供则全部会话开启（测试时可"仅限当前对话"）
+        # allSessions: true
+        # sessionOverrides:
+        #   'session-xxxxxxxx': true
+        # 审批等待通道答复的秒数，超时转回网页 UI
+        approvalTimeoutSecs: 600
+        # 提问等待通道答复的秒数，超时转回网页 UI
+        questionTimeoutSecs: 1800
+        # 长回复分段长度（Unicode 码点）
+        chunkMaxChars: 1200
+        # 消息合并窗口（秒）
+        mergeTimeoutSecs: 5
+        # iMessage 轮询间隔（秒）
+        imessagePollSecs: 5
+        # Email 轮询间隔（秒）
+        emailPollSecs: 20
+        # 状态文件路径（默认 $DSH_HOME/dsh-relay/state.json，仓库外）
+        statePath: ''
+        # 轮次结束推送（默认关闭；true 时每轮结束推送到通道，含 120 字片段）
+        turnEndPush: false
+        # 安全：allowInjection=false（默认）时裸文本不注入（共享通道共存安全，避免截胡发给其他 bot 的消息）；
+        # 如需通道内裸文本转向 agent，改为 true
+        # redactSecrets 对外发片段做密钥/令牌/凭据脱敏
+        security:
+          allowInjection: true
+          redactSecrets: true
+        channels:
+          imessage:
+            enabled: true
+            # 你的 iMessage 收件地址（手机号或 Apple ID 邮箱）；仅该地址可驱动插件。
+            # 留空 = 未配置；请在 profile 本地 patch 中填写（勿提交到 git）。
+            handle: ''
+            # 回复方可能用的其他可信地址（如手机号+邮箱同时绑定）
+            extraHandles: []
+          email:
+            enabled: false
+            # 发件与收件地址（通常同一个）
+            from: ''
+            to: ''
+            imap:
+              host: ''
+              port: 993
+              secure: true
+              user: ''
+              # 密码/授权码引用（对应 dsh credentials 中的键）；留空则用 auth.pass
+              passRef: 'DSH_RELAY_EMAIL_PASS'
+            smtp:
+              host: ''
+              port: 465
+              secure: true
+              user: ''
+              passRef: 'DSH_RELAY_EMAIL_PASS'
+          wechat:
+            enabled: false
+            # 白名单微信用户 id（ilink_user_id）；空 = 首个扫码确认的用户自动绑定
+            allowedUserId: ''
+            pollTimeoutSecs: 70

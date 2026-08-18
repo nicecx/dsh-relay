@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.DS_Store
+
+# 本地状态/凭据（即使误放仓库目录也忽略）
+state.json
+pending.json
+*.state
+.credentials*
+.env*
+*.local
+
+# 测试/构建产物
+coverage/
+*.tgz

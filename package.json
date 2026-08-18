@@ -1,0 +1,54 @@
+{
+  "name": "dsh-relay",
+  "version": "0.2.0",
+  "description": "DSH 远程诉求中转插件：把需要授权（approval）或开发建议（ask_user_question）的诉求按编号推送到 iMessage / Email / 微信等可配置通道，在通道内回复批准/拒绝/回答，并支持通过通道开启/关闭功能与按会话配置启用范围。",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "test",
+    "cordis.patch.yml",
+    "cli.js",
+    "README.md",
+    "TESTING.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "imapflow": "^1.0.190",
+    "mailparser": "^3.7.2",
+    "nodemailer": "^6.10.0"
+  },
+  "peerDependencies": {},
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node test/run-all.mjs",
+    "list": "node cli.js list",
+    "status": "node cli.js status"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "imessage",
+    "email",
+    "wechat",
+    "approval",
+    "remote",
+    "relay",
+    "notify"
+  ]
+}
