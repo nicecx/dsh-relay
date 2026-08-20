@@ -173,6 +173,18 @@ Telegram → [LoserFox/telegram](https://github.com/LoserFox/telegram)（Bot API
 微信 → [dsh-im-bridge](https://github.com/BiBoyang/dsh-im-bridge) 的 iLink 客户端（本项目已移植）。
 通道成熟度与实现来源矩阵见 [TESTING.md](TESTING.md)。
 
+## 通道健康监控（推荐搭配）
+
+dsh-relay 的通道轮询已委托给 **[dsh-task-watchdog](https://github.com/nicecx/dsh-task-watchdog)**（通用任务健康监控插件）：
+- 每个通道登记为 `ctx.jobs` 任务并接入 watchdog，轮询循环上报心跳；
+- 心跳停滞/启动卡死 → watchdog 自动抓**根因诊断快照**（进程状态/心跳/最近日志）→ 自动重启通道；
+- 区分**主动停止**（你通过命令关闭通道 → 不重启不告警）与**意外停滞**（崩溃 → 诊断+重启）；
+- 提供**事件流**（`watchdog.onEvent`），可对接任意通讯方式查看/审计 watchdog 的处理过程。
+
+> **推荐**：任何 DSH 插件有长轮询/后台任务的，都建议接入 dsh-task-watchdog（`ctx.jobs.start` 建任务 → `watchdog.monitor` + 循环里 `beat`），获得同样的监控/诊断/自愈能力。dsh-relay 本身不再内置 watchdog 逻辑（单一职责）。
+
+安装 watchdog：见 [dsh-task-watchdog README](https://github.com/nicecx/dsh-task-watchdog)。
+
 ## 测试与贡献
 
 ```bash

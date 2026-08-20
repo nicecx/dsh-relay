@@ -91,24 +91,35 @@ export function createEmailChannel(cfg, deps) {
       )
     },
     async start() {
-      const smtpPass = await resolvePass(cfg.smtp?.passRef, cfg.smtp?.pass)
-      try {
-        client = await createImapClient()
-        await client.connect()
-        connected = true
-        transport = nodemailer.createTransport({
-          host: cfg.smtp.host,
-          port: Number(cfg.smtp.port ?? 465),
-          secure: cfg.smtp.secure !== false,
-          auth: { user: cfg.smtp.user, pass: smtpPass },
-        })
-        await transport.verify()
-      } catch (err) {
-        deps.log.warn('email: 启动连接失败（通道不启动，等待下次重启）:', err?.message ?? err)
-        return
-      }
-      deps.log.info('email: SMTP/IMAP 已连接（%s → %s）', fromAddr, toAddr)
       running = true
+      // 连接失败不退出：定期重试（如 credentials 服务晚于插件加载），
+      // 一旦就绪自动连上；重试期间也上报心跳，避免 watchdog 误判 start-hang。
+      while (running && !deps.signal.aborted) {
+        const smtpPass = await resolvePass(cfg.smtp?.passRef, cfg.smtp?.pass)
+        try {
+          client = await createImapClient()
+          await client.connect()
+          connected = true
+          transport = nodemailer.createTransport({
+            host: cfg.smtp.host,
+            port: Number(cfg.smtp.port ?? 465),
+            secure: cfg.smtp.secure !== false,
+            auth: { user: cfg.smtp.user, pass: smtpPass },
+          })
+          await transport.verify()
+          break // 连接成功，退出重试循环
+        } catch (err) {
+          deps.log.warn('email: 启动连接失败（60s 后重试）:', err?.message ?? err)
+          deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:email') // 重试期间保持心跳
+          try { await client?.logout() } catch { /* 忽略 */ }
+          client = undefined
+          transport = undefined
+          connected = false
+          await sleep(60_000, deps.signal)
+        }
+      }
+      if (deps.signal.aborted) return
+      deps.log.info('email: SMTP/IMAP 已连接（%s → %s）', fromAddr, toAddr)
       while (running && !deps.signal.aborted) {
         await sleep(deps.pollSecs * 1000, deps.signal)
         if (!running || deps.signal.aborted) return
@@ -149,6 +160,8 @@ export function createEmailChannel(cfg, deps) {
 
   async function poll() {
     if (!client || !connected) return
+    // 心跳：watchdog 据此检测轮询停滞
+    deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:email')
     let lock
     try {
       lock = await client.getMailboxLock('INBOX')

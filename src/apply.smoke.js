@@ -35,7 +35,7 @@ function fakeCtx() {
       attachController: () => () => {},
       start: (spec) => {
         ctx.__jobCount += 1
-        return { kind: spec.kind, cancel: () => {} }
+        return `dsh-relay-${ctx.__jobCount}` // 真实 dsh-jobs 返回 JobId（string）
       },
     },
     __listeners: listeners,

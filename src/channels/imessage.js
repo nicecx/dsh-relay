@@ -265,6 +265,8 @@ export function createImessageChannel(cfg, deps) {
 
   async function poll() {
     if (handles.length === 0) return
+    // 心跳：watchdog 据此检测轮询停滞
+    deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:imessage')
     // 本轮实际处理（将交给 pushInbound）的消息 ROWID：cfg.markRead=true 时标注已读
     const processed = []
     // 系统 sqlite3 不支持位置参数绑定，句柄内联为转义后的字符串字面量；
@@ -301,6 +303,10 @@ export function createImessageChannel(cfg, deps) {
         if (rowid === '' || sender === '') continue
         // 启动后的新消息才处理（避免历史消息冲刷进会话）
         if (floorRowid > 0 && Number(rowid) <= floorRowid) continue
+        const messageId = `chatdb:${rowid}`
+        // 已见过的消息（含插件自己发的、前缀排除的）直接跳过，且必须 mark——
+        // 否则水位（seenRowids 最大）永远卡在最后一条"可处理"消息上，后续全部漏读。
+        if (deps.store.checkAndMark('imessage', messageId)) continue
         const body = typeof row.body === 'string' && row.body !== '' ? Buffer.from(row.body, 'hex') : undefined
         const text = String(row.text ?? '').trim() || extractFromAttributedBody(body)
         if (text === '') continue
@@ -309,13 +315,13 @@ export function createImessageChannel(cfg, deps) {
         // 排除其他机器人的消息（如 【ops-agent】）
         const prefixes = Array.isArray(cfg.ignorePrefixes) && cfg.ignorePrefixes.length > 0 ? cfg.ignorePrefixes : DEFAULT_IGNORE_PREFIXES
         if (prefixes.some((p) => text.startsWith(p))) continue
-        const messageId = `chatdb:${rowid}`
         processed.push(rowid)
         deps.pushInbound({
           channelId: 'imessage',
           senderId: sender,
           messageId,
           text,
+          alreadySeen: true, // poll 已 mark，pushInbound 不二次查重
         })
       }
       // 读信后标注已读（可选，cfg.markRead=true）：只标本轮实际处理过的白名单消息
@@ -332,7 +338,7 @@ export function createImessageChannel(cfg, deps) {
           deps.log.warn('iMessage: 无法读取 chat.db（TCC 未授权）。请在 系统设置 → 隐私与安全性 → 完全磁盘访问 中加入运行 DSH 的进程（%s）', process.execPath)
         }
       } else {
-        deps.log.warn('iMessage: 轮询失败:', msg)
+        deps.log.warn('iMessage: 轮询失败:', msg, err?.stack ?? '')
       }
     }
   }

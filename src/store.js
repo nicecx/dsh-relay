@@ -39,6 +39,8 @@ const emptyState = () => ({
   boundSessions: {},
   /** 通道 → 最近对话（最近一次诉求推送/注入所属的会话；裸文本续接目标） */
   channelContexts: {},
+  /** dsh-task-watchdog 诊断快照（停滞/重启时的根因证据，保留最近 10 条；由 watchdog 插件写入） */
+  channelDiag: [],
   /** 合并窗口缓冲快照（崩溃恢复；flush 后删除）：channelId → senderId → parts */
   mergeBuffers: {},
 })
@@ -73,6 +75,7 @@ export class RelayStore {
       if (raw.wechatContextTokens && typeof raw.wechatContextTokens === 'object') base.wechatContextTokens = raw.wechatContextTokens
       if (raw.boundSessions && typeof raw.boundSessions === 'object') base.boundSessions = raw.boundSessions
       if (raw.channelContexts && typeof raw.channelContexts === 'object') base.channelContexts = raw.channelContexts
+      if (Array.isArray(raw.channelDiag)) base.channelDiag = raw.channelDiag
       if (raw.mergeBuffers && typeof raw.mergeBuffers === 'object') base.mergeBuffers = raw.mergeBuffers
       return base
     } catch {

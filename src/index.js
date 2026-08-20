@@ -166,8 +166,11 @@ export function apply(ctx, config = {}) {
 
   const channels = []
 
-  const pushInbound = ({ channelId, senderId, messageId, text }) => {
-    if (store.checkAndMark(channelId, messageId)) return
+  const pushInbound = ({ channelId, senderId, messageId, text, alreadySeen = false }) => {
+    // 去重：已 mark 过则跳过。iMessage 通道在 poll 里已先 mark（含自身推送/前缀排除的消息，
+    // 保证水位推进），因此 imessage 传 alreadySeen=true 跳过这里的二次查重；
+    // 其他通道（email/wechat）仍在此处统一去重。
+    if (!alreadySeen && store.checkAndMark(channelId, messageId)) return
     const channel = channels.find((c) => c.id === channelId)
     if (channel === undefined) return
     if (!channel.isTrusted(senderId)) {
@@ -175,7 +178,11 @@ export function apply(ctx, config = {}) {
       return
     }
     void dispatch(text, channelId, senderId).then((reply) => {
-      if (reply === undefined || reply === '') return
+      // 回执兜底（2026-08-20）：可信发送者的消息绝不静默——dispatch 返回空时
+      // 也给一条轻量确认，让用户知道已收到（纯聊天文本/无操作命令均覆盖）。
+      if (reply === undefined || reply === '') {
+        reply = '✅ 已收到'
+      }
       channel.send(reply).catch((err) => log.warn('%s: 回执发送失败:', channelId, err))
     })
   }
@@ -190,7 +197,7 @@ export function apply(ctx, config = {}) {
     return undefined
   }
 
-  /** 每个通道一个可变 deps（signal 在启动时注入） */
+  /** 每个通道一个可变 deps（signal 在启动时注入；watchdog 服务由 dsh-task-watchdog 提供） */
   const channelDeps = Object.fromEntries(['imessage', 'email', 'wechat'].map((id) => [id, {
     store,
     log,
@@ -198,6 +205,7 @@ export function apply(ctx, config = {}) {
     chunkMaxChars: cfg.chunkMaxChars,
     stateDir,
     resolveSecret,
+    watchdog: ctx.get('watchdog'),
     pollSecs: id === 'imessage' ? cfg.imessagePollSecs : cfg.emailPollSecs,
     signal: undefined,
   }]))
@@ -493,12 +501,27 @@ export function apply(ctx, config = {}) {
         if (!ch.configured()) return `通道 ${ch.label} 尚未配置完整，请先填写 profile 配置。`
         if (cfg.channels?.[r.channel]?.enabled === false) return `通道 ${ch.label} 未在 profile 配置中启用（需修改 cordis.patch.yml 后重启）。`
         store.setChannelEnabled(r.channel, true)
+        // 重新开启：若通道曾主动停止，恢复轮询并重新注册到 watchdog
+        const runner = channelRunners.get(r.channel)
+        if (!runner) {
+          startChannelJob(ch)
+          registerChannelToWatchdog(ch)
+        }
         return `✅ 已开启 ${ch.label} 通道`
       }
       case 'disableChannel': {
         const ch = channels.find((c) => c.id === r.channel)
         if (ch === undefined) return `未知通道 ${r.channel}。`
         store.setChannelEnabled(r.channel, false)
+        // 主动关闭：停止通道轮询 + 通知 watchdog 停止监控（避免心跳停滞误判重启）
+        const runner = channelRunners.get(r.channel)
+        try { runner?.controller.abort() } catch { /* 忽略 */ }
+        try { ch.stop?.() } catch { /* 忽略 */ }
+        const wdOff = ctx.get('watchdog')
+        if (wdOff !== undefined) {
+          const jobId = channelRunners.get(r.channel)?.jobId
+          if (jobId) wdOff.stop(jobId) // 用真实 jobId 通知 watchdog 主动停止
+        }
         return `⏸ 已关闭 ${ch.label} 通道`
       }
       case 'enableAll':
@@ -626,14 +649,15 @@ export function apply(ctx, config = {}) {
 
   const jobs = ctx.jobs
 
-  for (const channel of channels) {
-    if (!channelActive(channel)) {
-      log.info('通道 %s 未启用或未配置，跳过启动', channel.id)
-      continue
-    }
+  /** 每个通道的运行句柄（watchdog 重启用） */
+  const channelRunners = new Map()
+
+  /** 启动单个通道的轮询 job；返回该通道的停止函数 */
+  const startChannelJob = (channel) => {
     const controller = new AbortController()
     channelDeps[channel.id].signal = controller.signal
-    jobs.start({
+    // ctx.jobs.start 返回真实 jobId（dsh-relay-N），watchdog 用它对接任务生命周期
+    const jobId = jobs.start({
       kind: 'dsh-relay',
       label: `${channel.label} 通道轮询`,
       run: () => {
@@ -648,6 +672,83 @@ export function apply(ctx, config = {}) {
         }
       },
     })
+    channelDeps[channel.id].jobId = jobId // 通道 poll 里 watchdog.beat 用真实 jobId
+    channelRunners.set(channel.id, { controller, channel, jobId })
+    return () => {
+      try { controller.abort() } catch { /* 忽略 */ }
+      channelRunners.delete(channel.id)
+    }
+  }
+
+  for (const channel of channels) {
+    if (!channelActive(channel)) {
+      log.info('通道 %s 未启用或未配置，跳过启动', channel.id)
+      continue
+    }
+    startChannelJob(channel)
+  }
+
+  // ---- 通道健康监控（2026-08-20）：委托给 dsh-task-watchdog 插件 ----
+  // 每个通道在 poll 循环里调用 deps.watchdog.beat(channel.id) 上报心跳；
+  // 停滞/启动失败由 watchdog 插件统一诊断、自动重启、失败告警。
+  // 本插件不再内置 watchdog 逻辑（单一职责，见 README 推荐）。
+  const watchdogSvc = ctx.get('watchdog')
+
+  /** 把单个通道注册到 watchdog（启动循环与「开启通道」命令共用） */
+  const registerChannelToWatchdog = (channel) => {
+    if (watchdogSvc === undefined) return
+    const runner = channelRunners.get(channel.id)
+    const jobId = runner?.jobId
+    if (!jobId) {
+      log.warn('watchdog: 通道 %s 尚无 jobId（jobs.start 未返回？），跳过监控注册', channel.id)
+      return
+    }
+    const unreg = watchdogSvc.monitor({
+      jobId, // 对接 ctx.jobs 的真实任务 id：任务终结/被 kill → watchdog 自动移除监控
+      label: `${channel.label} 通道轮询`,
+      restart: () => {
+        // 若通道已被用户主动关闭（channelEnabled=false 或 relay 总开关关闭），
+        // 不重启——改为通知 watchdog 主动停止（区分"主动停止"与"意外停滞"）
+        if (!channelActive(channel) || !store.relayEnabled) {
+          log.info('watchdog: 通道 %s 已被主动关闭，通知 watchdog 停止监控（不重启）', channel.id)
+          watchdogSvc.stop(jobId)
+          return
+        }
+        log.warn('watchdog: 重启通道 %s…', channel.id)
+        const runner2 = channelRunners.get(channel.id)
+        try { runner2?.controller.abort() } catch { /* 忽略 */ }
+        void Promise.resolve()
+          .then(() => { try { return channel.stop() } catch { /* 忽略 */ } })
+          .then(() => startChannelJob(channel))
+          .catch((err) => log.warn('watchdog: 通道 %s 重启异常:', channel.id, err))
+      },
+      persist: (diag) => {
+        // 诊断快照落盘到 store（跨重启保留，供根因分析）
+        try {
+          const prev = Array.isArray(store.state.channelDiag) ? store.state.channelDiag : []
+          store.state.channelDiag = [...prev.slice(-9), { ...diag, channelId: channel.id }]
+          store.saveSoon()
+        } catch (err) {
+          log.warn('watchdog: 诊断落盘失败（%s）:', channel.id, err)
+        }
+      },
+      alertSink: (msg) => {
+        const alive = activeChannels().filter((c) => c.id !== channel.id)
+        for (const ch of alive) {
+          ch.send(msg).catch((err) => log.warn('watchdog: 告警推送失败（%s）:', ch.id, err))
+        }
+      },
+    })
+    disposers.push(unreg)
+  }
+
+  if (watchdogSvc !== undefined) {
+    for (const channel of channels) {
+      if (channelActive(channel)) registerChannelToWatchdog(channel)
+    }
+    log.info('dsh-relay: 已注册 %s 个通道到 watchdog 服务', channels.filter(channelActive).length)
+  } else {
+    log.warn('dsh-relay: 未找到 watchdog 服务（dsh-task-watchdog 未安装？），通道健康监控不可用')
   }
 
   // ---- /relay 命令（网页命令输入行：罗列未回复诉求/状态） ----
@@ -680,6 +781,6 @@ export function apply(ctx, config = {}) {
     requests.dispose()
     store.flush()
   })
-  try { testHooks.set(ctx, { dispatch, store, requests, boundSessionFor }) } catch { /* 测试钩子失败不影响运行 */ }
+  try { testHooks.set(ctx, { dispatch, store, requests, boundSessionFor, pushInbound }) } catch { /* 测试钩子失败不影响运行 */ }
   log.info('dsh-relay loaded（状态文件 %s）', statePath)
 }

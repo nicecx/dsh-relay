@@ -348,6 +348,20 @@ t('store: seenRowids 解析（水位用）', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+t('store: 被排除的消息也 mark（水位推进，防漏读）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-relay-'))
+  const s = new RelayStore(join(dir, 'state.json'))
+  // 模拟 poll：先 mark 所有读到的消息（包括自身推送），再走过滤
+  s.checkAndMark('imessage', 'chatdb:100')  // 自身推送（D5HR42），仍 mark
+  s.checkAndMark('imessage', 'chatdb:101')  // 前缀排除（【），仍 mark
+  s.checkAndMark('imessage', 'chatdb:102')  // 正常入站
+  // 水位 = 最大 rowid，必须包含被排除的
+  assert.deepEqual(s.seenRowids('imessage'), [100, 101, 102])
+  // 二次读到同一条 → checkAndMark 返回 true（去重）
+  assert.equal(s.checkAndMark('imessage', 'chatdb:101'), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 t('email: 认证失败/严格模式拒绝、In-Reply-To 补编号', () => {
   const sentIds = new Map([['<msg-1@x>', 7]])
   // dkim fail → reject

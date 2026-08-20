@@ -620,6 +620,35 @@ t('dispatch: 无编号裸文本续接通道最近对话（优先于显式绑定�
   assert.equal(contFollowed[0].id, 'session-A', '应续接通道最近对话，而非全局绑定会话')
 })
 
+// ---------- 回执兜底（2026-08-20）：可信发送者的消息绝不静默 ----------
+
+const ackCtx = fakeCtx({})
+ackCtx.sessions = { list: () => [] }
+ackCtx.agents = { get: (id) => ({ id, followup: () => {} }) }
+const ackSent = []
+const ackConfig = {
+  enabled: true, approvalTimeoutSecs: 600, questionTimeoutSecs: 1800,
+  chunkMaxChars: 1200, mergeTimeoutSecs: 5, imessagePollSecs: 5, emailPollSecs: 20,
+  statePath: join(tmp, 'state6.json'),
+  channels: { imessage: { enabled: false }, email: { enabled: false }, wechat: { enabled: false } },
+  security: { allowInjection: false, redactSecrets: true },  // 裸文本注入关闭 → dispatch 返回空 → 兜底回执
+  boundSessions: { imessage: 'session-11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa' },
+}
+applyReal(ackCtx, ackConfig)
+const ackHook = testHooks.get(ackCtx)
+
+// 构造一个已注册的审批诉求（非外来编号），回复后应有明确回执
+const ackN = ackHook.store.allocNumber()
+void ackHook.requests.register({ number: ackN, kind: 'approval', sessionId: 'session-11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa', timeoutMs: 5000 })
+
+t('回执兜底: dispatch 返回空时 pushInbound 也发送确认（不静默）', async () => {
+  // 有诉求在队列时，回复任意编号都有明确回执（#99 不在队列 → "已结束"提示，非静默）
+  const ackedForeign = await ackHook.dispatch('把99号批了', 'imessage', 'sender')
+  assert.ok(typeof ackedForeign === 'string' && ackedForeign.includes('#99'), ackedForeign)
+  const acked = await ackHook.dispatch(`#${ackN} 批准`, 'imessage', 'sender')
+  assert.ok(typeof acked === 'string' && acked.includes('已批准'), acked)
+})
+
 // 保活计时器：requests 的超时定时器 unref，需一个引用计时器保持事件循环，超时用例才能结算
 const alive = setInterval(() => {}, 1000)
 for (const { name, fn } of tests) {

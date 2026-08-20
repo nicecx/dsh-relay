@@ -191,6 +191,8 @@ export function createWechatChannel(cfg, deps) {
         deps.log.warn('wechat: 登录链接落盘失败:', err)
       }
       while (!deps.signal.aborted) {
+        // 等待扫码期间也上报心跳：通道活着（只是等用户扫码），不应被判为 start-hang
+        deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:wechat')
         let st
         try {
           st = await client.checkQRStatus(qr.qrcodeId)
@@ -230,6 +232,8 @@ export function createWechatChannel(cfg, deps) {
       loggedIn = true
       deps.log.info('wechat: 登录完成，开始长轮询')
       while (running && !deps.signal.aborted) {
+        // 心跳：watchdog 据此检测轮询停滞
+        deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:wechat')
         let page
         try {
           page = await client.getUpdates(cursor, Number(cfg.pollTimeoutSecs ?? 70))
