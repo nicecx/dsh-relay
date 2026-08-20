@@ -185,6 +185,8 @@ export function createImessageChannel(cfg, deps) {
   let running = false
   let lastChatRefresh = 0
   let lastTccWarnAt = 0
+  /** 最近一条可信入站来自的会话（chat_identifier）：回执优先发回该会话 */
+  let lastInboundChat = ''
   /** 启动时的最大 rowid 水位：只处理启动后的新消息，避免历史消息冲刷 */
   let floorRowid = 0
 
@@ -218,6 +220,20 @@ export function createImessageChannel(cfg, deps) {
     ], { timeout: 10_000 })
     const id = stdout.trim()
     return id || undefined
+  }
+
+  /** 通过 AppleScript 发送到指定 chat id（附加自标记防回灌） */
+  async function sendAppleScript(text, chatId) {
+    const script = [
+      'on run argv',
+      '  set msg to item 1 of argv',
+      '  set cid to item 2 of argv',
+      '  tell application "Messages"',
+      '    send msg to chat id cid',
+      '  end tell',
+      'end run',
+    ]
+    await runAppleScript(script, [`${text}${SELF_MARKER}`, chatId])
   }
 
   return {
@@ -266,21 +282,26 @@ export function createImessageChannel(cfg, deps) {
       running = false
     },
     async send(text) {
-      const chatId = await resolveSendTarget()
-      if (chatId === undefined) {
-        throw new Error('iMessage: 无可用会话（请先给本机发一条 iMessage）')
+      // 优先发回"最近一条可信入站"的会话（回复对话语义）。chat_identifier 需加服务前缀
+      // 构造成 chat id（any;-;xxx）；若 Messages 不认该会话（如手机号会话被隐藏），
+      // 回退默认发送目标（resolveSendTarget 的 msn.com 会话）。
+      let chatId = lastInboundChat ? `any;-;${lastInboundChat}` : undefined
+      let sent = false
+      if (chatId) {
+        try {
+          await sendAppleScript(text, chatId)
+          sent = true
+        } catch (err) {
+          deps.log.warn('iMessage: 发回原会话 %s 失败（%s），回退默认目标', lastInboundChat, err?.message ?? err)
+        }
       }
-      const script = [
-        'on run argv',
-        '  set msg to item 1 of argv',
-        '  set cid to item 2 of argv',
-        '  tell application "Messages"',
-        '    send msg to chat id cid',
-        '  end tell',
-        'end run',
-      ]
-      // 附加不可见自标记：轮询据此排除本插件自己的推送
-      await runAppleScript(script, [`${text}${SELF_MARKER}`, chatId])
+      if (!sent) {
+        const fallback = await resolveSendTarget()
+        if (fallback === undefined) {
+          throw new Error('iMessage: 无可用会话（请先给本机发一条 iMessage）')
+        }
+        await sendAppleScript(text, fallback)
+      }
     },
     isTrusted(senderId) {
       return trusted().has(String(senderId).toLowerCase())
@@ -318,7 +339,8 @@ export function createImessageChannel(cfg, deps) {
       ? ` AND EXISTS (SELECT 1 FROM chat_message_join cm JOIN chat c ON c.ROWID = cm.chat_id WHERE cm.message_id = m.ROWID AND c.chat_identifier LIKE '%${chatScope.replaceAll("'", "''").replaceAll('%', '\%').replaceAll('_', '\_')}%' ESCAPE '\\')`
       : ''
     const sql = [
-      'SELECT m.ROWID AS rowid, m.text AS text, hex(m.attributedBody) AS body, h.id AS sender, m.is_from_me AS me, m.date AS date FROM message m JOIN handle h ON h.ROWID = m.handle_id',
+      'SELECT m.ROWID AS rowid, m.text AS text, hex(m.attributedBody) AS body, h.id AS sender, m.is_from_me AS me, m.date AS date,',
+      '(SELECT c.chat_identifier FROM chat_message_join cm2 JOIN chat c ON c.ROWID = cm2.chat_id WHERE cm2.message_id = m.ROWID ORDER BY cm2.chat_id LIMIT 1) AS chat FROM message m JOIN handle h ON h.ROWID = m.handle_id',
       `WHERE ((m.text IS NOT NULL AND m.text != '') OR (m.attributedBody IS NOT NULL AND length(m.attributedBody) > 0)) AND h.id IN (${sqlSafe})${scopeSql}`,
       'ORDER BY m.ROWID DESC LIMIT 50',
     ].join(' ')
@@ -356,6 +378,8 @@ export function createImessageChannel(cfg, deps) {
         const prefixes = Array.isArray(cfg.ignorePrefixes) && cfg.ignorePrefixes.length > 0 ? cfg.ignorePrefixes : DEFAULT_IGNORE_PREFIXES
         if (prefixes.some((p) => text.startsWith(p))) continue
         processed.push(rowid)
+        // 记录来源会话：回执应发回用户回复的同一会话（避免"手机号会话回复→回执发到 msn 会话"）
+        if (row.chat) lastInboundChat = String(row.chat)
         deps.pushInbound({
           channelId: 'imessage',
           senderId: sender,
