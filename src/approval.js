@@ -29,7 +29,8 @@ export function attachApprovalRelay(ctx, relay) {
       ].join('\n')
       relay.pushAll(prompt, { number, kind: 'approval', sessionId })
 
-      // 双轨：通道裁决（register 挂起等通道回复） vs 网页裁决（next 挂起等网页用户）
+      // 双轨：通道裁决（register 挂起等通道回复，优先） vs 网页裁决（next 显示+挂起，兜底）。
+      // 通道回复立即生效（手机批准有效）；网页仅作可见性与兜底（通道超时后网页可批）。
       const channelVerdict = relay.requests.register({
         number,
         kind: 'approval',
@@ -42,27 +43,20 @@ export function attachApprovalRelay(ctx, relay) {
         .then((outcome) => ({ source: 'web', outcome }))
         .catch(() => ({ source: 'web', outcome: undefined }))
 
-      const channelResult = channelVerdict.then((v) => ({ source: 'channel', outcome: v }))
+      // 通道优先：等通道裁决；通道 settle（含超时）前不理会网页。
+      // 网页显示由 next() 挂起承载（api-proxy 挂起等网页用户，不返回）。
+      const channelResult = await channelVerdict
 
-      const first = await Promise.race([channelResult, webOutcome])
+      if (channelResult === 'allow') return 'allowed-once'
+      if (channelResult === 'reject') return 'rejected'
 
-      if (first.source === 'channel') {
-        const verdict = first.outcome
-        if (verdict === 'allow') return 'allowed-once'
-        if (verdict === 'reject') return 'rejected'
-        // 通道超时/中止：网页侧仍在显示挂起（next 已调用），用户随时可点。
-        // 返回 unavailable 结束本监听器（网页 pending 的迟到结算安全），
-        // 不阻塞等网页——网页用户操作后由 api-proxy 自行 settle。
-        return 'unavailable'
-      }
-
-      // 网页先答：结算通道侧（通道收到"已在电脑端处理"，避免手机悬挂）
-      const outcome = first.outcome
-      if (outcome === 'allowed-once') relay.requests.answer(number, 'allow')
-      else if (outcome === 'rejected') relay.requests.answer(number, 'reject')
+      // 通道超时/中止：网页侧仍在显示挂起（next 已调用），用户可在网页批准/拒绝。
+      // 等网页裁决（用户点或 req.signal abort）。
+      const web = await webOutcome
+      const outcome = web.outcome
       const done = { 'allowed-once': '✅ 已在电脑端批准', rejected: '❌ 已在电脑端拒绝', cancelled: '⏹ 已在电脑端取消' }[outcome]
       if (done) relay.pushAll(`#${number} ${done}`, { number, kind: 'approval', sessionId })
-      return outcome
+      return outcome ?? 'unavailable'
     },
     { prepend: true, global: true },
   )

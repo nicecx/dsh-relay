@@ -91,7 +91,7 @@ t('approval: 拒绝 → rejected', async () => {
   assert.equal(await outcomePromise, 'rejected')
 })
 
-t('approval: 超时 → 委托下游 next()', async () => {
+t('approval: 通道超时 → 等网页裁决（next 挂起模拟网页）', async () => {
   const ctx = fakeCtx()
   const store = new RelayStore(storePath)
   const requests = new RequestRegistry()
@@ -105,11 +105,17 @@ t('approval: 超时 → 委托下游 next()', async () => {
   }
   attachApprovalRelay(ctx, relay)
   const listener = ctx.__listeners['approval/request'][0]
-  // 双轨下 next() 立即调用（网页也显示）；真实 api-proxy 挂起等网页用户。
-  // 这里用"挂起 next"模拟：网页用户不操作 → 通道超时后转回本机答案器。
-  const outcome = await listener({ agent: { session: { id: 's1', events: [] } }, toolName: 'bash', signal: undefined }, () => new Promise(() => {}))
-  assert.equal(outcome, 'unavailable', '通道超时、网页不答 → 无可用结果')
-  assert.equal(requests.size, 0, '超时后 pending 清空')
+  // next 返回可外部 resolve 的 promise：模拟网页审批卡挂起，之后用户批准
+  let resolveWeb
+  const webPromise = new Promise((r) => { resolveWeb = r })
+  const outcomePromise = listener({ agent: { session: { id: 's1', events: [] } }, toolName: 'bash', signal: undefined }, () => webPromise)
+  // 等通道超时（0.3s）后，网页批准
+  await new Promise((r) => setTimeout(r, 500))
+  resolveWeb('allowed-once')
+  const outcome = await outcomePromise
+  assert.equal(outcome, 'allowed-once', '通道超时后网页批准生效')
+  assert.equal(requests.size, 0, '网页批准后 pending 清空')
+  assert.ok(pushed.some((p) => p.text.includes('已在电脑端批准')), '通道收到完成通知')
 })
 
 t('approval: 未启用通道 → 直接 next()', async () => {
