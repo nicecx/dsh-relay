@@ -10,7 +10,7 @@ import { RelayStore } from './store.js'
 import { splitReply } from './chunk.js'
 import { chatControl } from './merge.js'
 import { redactSecrets, parseEmailAuth, emailAuthVerdict } from './secure.js'
-import { extractFromAttributedBody, buildMarkReadSql } from './channels/imessage.js'
+import { extractFromAttributedBody, buildMarkReadSql, buildFindChatSql } from './channels/imessage.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -429,6 +429,28 @@ t('imessage: 通用会话范围 chatScope（空=全部，子串匹配）', () =>
   assert.equal(chatInScope('any;-;you@icloud.com', 'you@icloud.com'), true)
   assert.equal(chatInScope('any;-;+8613800000000', '+8613800000000'), true)
   assert.equal(chatInScope('any;-;+8613800000000', '+86'), true)        // 前缀/子串
+})
+
+t('imessage: buildFindChatSql 空 scope 收全部会话（手机号+msn 都能找到）', () => {
+  const handles = ['you@msn.com', 'you@icloud.com', '+8613800000000', '13800000000']
+  const sql = buildFindChatSql(handles, '')
+  // 空 scope 无会话过滤（这是修复"手机回复进手机号会话被 chatScope 挡住"的关键）
+  assert.ok(!sql.includes('chat_identifier LIKE'), '空 scope 不过滤会话')
+  // 所有 handle 都在 IN 列表（含手机号）
+  assert.ok(sql.includes("'you@msn.com'") && sql.includes("'+8613800000000'"), '白名单 handle 全含')
+  // 结构完整
+  assert.ok(sql.includes('ORDER BY MAX(m.date) DESC LIMIT 1'), '按最近会话')
+  assert.ok(sql.includes('JOIN handle h ON h.ROWID = m.handle_id'), 'join handle')
+})
+
+t('imessage: buildFindChatSql 有 scope 时按子串过滤且转义 SQL 特殊字符', () => {
+  const sql = buildFindChatSql(['you@msn.com'], 'you@msn.com')
+  assert.ok(sql.includes("chat_identifier LIKE '%you@msn.com%'"), '子串过滤')
+  assert.ok(sql.includes("ESCAPE '\\'"), 'LIKE 转义')
+  // 单引号注入安全：handle 里的单引号转义为 ''（SQL 标准）
+  const inj = buildFindChatSql(["o'neill@x.com"], 'x')
+  assert.ok(inj.includes("'o''neill@x.com'"), 'handle 单引号转义为双引号')
+  assert.ok(!inj.includes("'o'neill@x.com'"), '未转义的单引号不得出现')
 })
 
 t('imessage: buildMarkReadSql 只含数字 ROWID 且去重', () => {

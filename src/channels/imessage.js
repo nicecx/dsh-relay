@@ -143,6 +143,26 @@ export function chatInScope(chatId, scope) {
 }
 
 /**
+ * 构造"chat.db 查找白名单 handle 最近会话"的 SQL（纯函数，供单测）。
+ * chatScope 为空=全部会话（手机号会话/msn 会话都收）；否则子串过滤。
+ * 用于 AppleScript findChats 找不到会话（Messages 隐藏/归档但仍收信）时的发送兜底。
+ */
+export function buildFindChatSql(handlesList, scope) {
+  const sqlSafe = handlesList.map((h) => `'${String(h).replaceAll("'", "''")}'`).join(',')
+  const scopeSql = scope
+    ? ` AND c.chat_identifier LIKE '%${String(scope).replaceAll("'", "''").replaceAll('%', '\\%').replaceAll('_', '\\_')}%' ESCAPE '\\'`
+    : ''
+  return [
+    'SELECT c.chat_identifier FROM chat c',
+    'JOIN chat_message_join cm ON cm.chat_id = c.ROWID',
+    'JOIN message m ON m.ROWID = cm.message_id',
+    'JOIN handle h ON h.ROWID = m.handle_id',
+    `WHERE h.id IN (${sqlSafe})${scopeSql}`,
+    'GROUP BY c.chat_identifier ORDER BY MAX(m.date) DESC LIMIT 1',
+  ].join(' ')
+}
+
+/**
  * 构造"标注已读"的 SQL（纯函数，供单测）：
  * 只更新给定 ROWID（poll 实际处理过、来自白名单发送者的消息），
  * 不触碰其他会话/其他发送者的未读状态。
@@ -174,10 +194,30 @@ export function createImessageChannel(cfg, deps) {
   async function resolveSendTarget(forceRefresh = false) {
     if (!forceRefresh && chatCache.length > 0 && Date.now() - lastChatRefresh < 60_000) return chatCache[0].chatId
     chatCache = (await findChats(handles)).filter((c) => chatInScope(c.chatId, chatScope))
+    // AppleScript 找不到会话（macOS Messages 隐藏/归档但仍收信的会话）时，
+    // 回退 chat.db：按白名单 handle 找最近的 chat_identifier 构造发送目标。
+    if (chatCache.length === 0) {
+      try {
+        const viaDb = await findChatViaDb(handles, chatScope)
+        if (viaDb) chatCache = [{ chatId: viaDb, serviceType: 'iMessage' }]
+      } catch (err) {
+        deps.log.debug('iMessage: chat.db 会话回退失败:', err)
+      }
+    }
     lastChatRefresh = Date.now()
     if (chatCache.length === 0) return undefined
     const preferred = chatCache.find((c) => c.serviceType === 'iMessage') ?? chatCache[0]
     return preferred.chatId
+  }
+
+  /** 从 chat.db 找白名单 handle 的最近会话 chat_identifier（AppleScript 找不到时兜底） */
+  async function findChatViaDb(handlesList, scope) {
+    const sql = buildFindChatSql(handlesList, scope)
+    const { stdout } = await execFileAsync('sqlite3', [
+      '-readonly', `file:${CHAT_DB}?mode=ro`, sql,
+    ], { timeout: 10_000 })
+    const id = stdout.trim()
+    return id || undefined
   }
 
   return {
