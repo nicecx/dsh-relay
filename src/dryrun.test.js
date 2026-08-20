@@ -60,7 +60,7 @@ t('approval: 推送→编号→批准 → allowed-once', async () => {
   attachApprovalRelay(ctx, relay)
   const listener = ctx.__listeners['approval/request'][0]
   const req = { agent: { session: { id: 's1', events: [] } }, toolName: 'bash', reason: 'rm -rf', signal: undefined }
-  const outcomePromise = listener(req, async () => 'downstream')
+  const outcomePromise = listener(req, () => new Promise(() => {})) // 双轨：网页侧挂起，等通道
   assert.equal(pushed.length, 1, '应推送一次')
   assert.ok(pushed[0].text.includes('需要批准'))
   assert.ok(pushed[0].text.includes('bash'))
@@ -85,7 +85,7 @@ t('approval: 拒绝 → rejected', async () => {
   }
   attachApprovalRelay(ctx, relay)
   const listener = ctx.__listeners['approval/request'][0]
-  const outcomePromise = listener({ agent: { session: { id: 's1', events: [] } }, toolName: 'bash', signal: undefined }, async () => 'downstream')
+  const outcomePromise = listener({ agent: { session: { id: 's1', events: [] } }, toolName: 'bash', signal: undefined }, () => new Promise(() => {})) // 双轨：网页侧挂起，等通道
   const n = pushed[0].meta.number
   assert.equal(requests.answer(n, 'reject'), 'ok')
   assert.equal(await outcomePromise, 'rejected')
@@ -105,9 +105,11 @@ t('approval: 超时 → 委托下游 next()', async () => {
   }
   attachApprovalRelay(ctx, relay)
   const listener = ctx.__listeners['approval/request'][0]
-  const outcome = await listener({ agent: { session: { id: 's1', events: [] } }, toolName: 'bash', signal: undefined }, async () => 'downstream')
-  assert.equal(outcome, 'downstream', '超时应转回本机答案器')
-  assert.equal(requests.size, 0)
+  // 双轨下 next() 立即调用（网页也显示）；真实 api-proxy 挂起等网页用户。
+  // 这里用"挂起 next"模拟：网页用户不操作 → 通道超时后转回本机答案器。
+  const outcome = await listener({ agent: { session: { id: 's1', events: [] } }, toolName: 'bash', signal: undefined }, () => new Promise(() => {}))
+  assert.equal(outcome, 'unavailable', '通道超时、网页不答 → 无可用结果')
+  assert.equal(requests.size, 0, '超时后 pending 清空')
 })
 
 t('approval: 未启用通道 → 直接 next()', async () => {
