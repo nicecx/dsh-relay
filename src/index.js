@@ -649,10 +649,14 @@ export function apply(ctx, config = {}) {
 
   const jobs = ctx.jobs
 
-  /** 每个通道的运行句柄（watchdog 重启用） */
+  /** 每个通道的运行句柄（watchdog 恢复时替换） */
   const channelRunners = new Map()
 
-  /** 启动单个通道的轮询 job；返回该通道的停止函数 */
+  /**
+   * 启动单个通道的轮询 job，返回 { jobId, stop }。
+   * 也是 watchdog 恢复机制的 spawn：重建通道任务时再次调用，
+   * 用新 controller 替换旧句柄（旧 controller 由 watchdog kill 触发 abort）。
+   */
   const startChannelJob = (channel) => {
     const controller = new AbortController()
     channelDeps[channel.id].signal = controller.signal
@@ -674,9 +678,12 @@ export function apply(ctx, config = {}) {
     })
     channelDeps[channel.id].jobId = jobId // 通道 poll 里 watchdog.beat 用真实 jobId
     channelRunners.set(channel.id, { controller, channel, jobId })
-    return () => {
-      try { controller.abort() } catch { /* 忽略 */ }
-      channelRunners.delete(channel.id)
+    return {
+      jobId,
+      stop: () => {
+        try { controller.abort() } catch { /* 忽略 */ }
+        channelRunners.delete(channel.id)
+      },
     }
   }
 
@@ -706,21 +713,19 @@ export function apply(ctx, config = {}) {
     const unreg = watchdogSvc.monitor({
       jobId, // 对接 ctx.jobs 的真实任务 id：任务终结/被 kill → watchdog 自动移除监控
       label: `${channel.label} 通道轮询`,
-      restart: () => {
-        // 若通道已被用户主动关闭（channelEnabled=false 或 relay 总开关关闭），
-        // 不重启——改为通知 watchdog 主动停止（区分"主动停止"与"意外停滞"）
+      // 恢复机制由 watchdog 全权处理（kill 旧 job → spawn 重建 → 自动重新 monitor）。
+      // 消费方只提供 spawn：怎么"建一个新通道任务"。若通道已被用户主动关闭，
+      // 返回空让 watchdog 停止监控（区分主动停止与意外停滞）。
+      spawn: () => {
         if (!channelActive(channel) || !store.relayEnabled) {
-          log.info('watchdog: 通道 %s 已被主动关闭，通知 watchdog 停止监控（不重启）', channel.id)
-          watchdogSvc.stop(jobId)
-          return
+          log.info('watchdog: 通道 %s 已被主动关闭，恢复时不再重建', channel.id)
+          return undefined
         }
-        log.warn('watchdog: 重启通道 %s…', channel.id)
-        const runner2 = channelRunners.get(channel.id)
-        try { runner2?.controller.abort() } catch { /* 忽略 */ }
-        void Promise.resolve()
-          .then(() => { try { return channel.stop() } catch { /* 忽略 */ } })
-          .then(() => startChannelJob(channel))
-          .catch((err) => log.warn('watchdog: 通道 %s 重启异常:', channel.id, err))
+        log.warn('watchdog: 重建通道 %s（spawn）…', channel.id)
+        // 停旧通道（旧 job 由 watchdog kill）
+        try { channel.stop?.() } catch { /* 忽略 */ }
+        const spawned = startChannelJob(channel)
+        return spawned.jobId
       },
       persist: (diag) => {
         // 诊断快照落盘到 store（跨重启保留，供根因分析）
