@@ -40,7 +40,9 @@ export function processEmailMessage({ uid, parsed, cfg, sentIds }) {
 export function createEmailChannel(cfg, deps) {
   let client
   let transport
-  let running = false
+  // 循环代际：同 imessage——共享 running 布尔会被 spawn 重建（stop→start）竞争，
+  // 旧循环重新"复活"成僵尸；stop 递增代际让旧循环失效。
+  let runSeq = 0
   let connected = false
   /** sentMessageId -> request number */
   const sentIds = new Map()
@@ -91,10 +93,11 @@ export function createEmailChannel(cfg, deps) {
       )
     },
     async start() {
-      running = true
+      const myRun = ++runSeq
+      const signal = deps.signal // 局部捕获：重建时 deps.signal 会被替换，旧循环必须监听自己的信号
       // 连接失败不退出：定期重试（如 credentials 服务晚于插件加载），
       // 一旦就绪自动连上；重试期间也上报心跳，避免 watchdog 误判 start-hang。
-      while (running && !deps.signal.aborted) {
+      while (myRun === runSeq && !signal.aborted) {
         const smtpPass = await resolvePass(cfg.smtp?.passRef, cfg.smtp?.pass)
         try {
           client = await createImapClient()
@@ -110,24 +113,24 @@ export function createEmailChannel(cfg, deps) {
           break // 连接成功，退出重试循环
         } catch (err) {
           deps.log.warn('email: 启动连接失败（60s 后重试）:', err?.message ?? err)
-          deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:email') // 重试期间保持心跳
+          deps.watchdog?.beat(deps.jobId?.value ?? 'dsh-relay:email') // 重试期间保持心跳
           try { await client?.logout() } catch { /* 忽略 */ }
           client = undefined
           transport = undefined
           connected = false
-          await sleep(60_000, deps.signal)
+          await sleep(60_000, signal)
         }
       }
-      if (deps.signal.aborted) return
+      if (signal.aborted) return
       deps.log.info('email: SMTP/IMAP 已连接（%s → %s）', fromAddr, toAddr)
-      while (running && !deps.signal.aborted) {
-        await sleep(deps.pollSecs * 1000, deps.signal)
-        if (!running || deps.signal.aborted) return
-        await poll()
+      while (myRun === runSeq && !signal.aborted) {
+        await sleep(deps.pollSecs * 1000, signal)
+        if (myRun !== runSeq || signal.aborted) return
+        await poll(signal)
       }
     },
     async stop() {
-      running = false
+      runSeq += 1
       try { transport?.close() } catch { /* 忽略 */ }
       try { await client?.logout() } catch { /* 忽略 */ }
       connected = false
@@ -158,10 +161,12 @@ export function createEmailChannel(cfg, deps) {
     },
   }
 
-  async function poll() {
+  async function poll(signal) {
     if (!client || !connected) return
     // 心跳：watchdog 据此检测轮询停滞
-    deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:email')
+    deps.watchdog?.beat(deps.jobId?.value ?? 'dsh-relay:email')
+    // 活动脉冲（诊断）
+    try { deps.store.touchPulse?.('email') } catch { /* 诊断字段非必需 */ }
     let lock
     try {
       lock = await client.getMailboxLock('INBOX')
@@ -171,7 +176,7 @@ export function createEmailChannel(cfg, deps) {
       if (status.uidNext <= from) return
       let maxUid = last
       for await (const msg of client.fetch(`${from}:*`, { uid: true, source: true })) {
-        if (deps.signal.aborted) return
+        if (signal.aborted) return
         try {
           const uid = Number(msg.uid)
           if (uid > maxUid) maxUid = uid
@@ -189,24 +194,24 @@ export function createEmailChannel(cfg, deps) {
             text: decision.body,
           })
         } catch (err) {
-          if (!deps.signal.aborted) deps.log.warn('email: 单封解析失败（跳过）:', err)
+          if (!signal.aborted) deps.log.warn('email: 单封解析失败（跳过）:', err)
         }
       }
       deps.store.setEmailCursor(maxUid)
     } catch (err) {
-      if (!deps.signal.aborted) {
+      if (!signal.aborted) {
         connected = false
         deps.log.warn('email: 轮询失败，5s 后尝试重连:', err)
         try { await client?.logout() } catch { /* 忽略 */ }
         client = undefined
-        await sleep(5000, deps.signal)
-        if (running && !deps.signal.aborted) {
+        await sleep(5000, signal)
+        if (runSeq > 0 && !signal.aborted) {
           try {
             client = await createImapClient()
             await client.connect()
             connected = true
           } catch (err2) {
-            if (!deps.signal.aborted) deps.log.warn('email: 重连失败:', err2)
+            if (!signal.aborted) deps.log.warn('email: 重连失败:', err2)
           }
         }
       }

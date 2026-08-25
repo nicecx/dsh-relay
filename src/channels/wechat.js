@@ -169,18 +169,19 @@ function isTimeout(err) {
 
 export function createWechatChannel(cfg, deps) {
   const client = new ILinkClient()
-  let running = false
+  // 循环代际：同 imessage——stop 递增使其失效，防止重建时旧循环复活成僵尸。
+  let runSeq = 0
   let loggedIn = false
   let cursor = ''
 
-  async function login() {
-    while (!deps.signal.aborted) {
+  async function login(signal) {
+    while (!signal.aborted) {
       let qr
       try {
         qr = await client.getQRCode()
       } catch (err) {
         deps.log.warn('wechat: 获取二维码失败，5s 后重试:', err)
-        await sleep(5000, deps.signal)
+        await sleep(5000, signal)
         continue
       }
       deps.log.warn('wechat: 请用微信扫码登录（iLink）: %s', qr.qrUrl)
@@ -190,19 +191,19 @@ export function createWechatChannel(cfg, deps) {
       } catch (err) {
         deps.log.warn('wechat: 登录链接落盘失败:', err)
       }
-      while (!deps.signal.aborted) {
+      while (!signal.aborted) {
         // 等待扫码期间也上报心跳：通道活着（只是等用户扫码），不应被判为 start-hang
-        deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:wechat')
+        deps.watchdog?.beat(deps.jobId?.value ?? 'dsh-relay:wechat')
         let st
         try {
           st = await client.checkQRStatus(qr.qrcodeId)
         } catch (err) {
           if (!isTimeout(err)) deps.log.warn('wechat: 查询扫码状态失败，2s 后重试:', err)
-          await sleep(2000, deps.signal)
+          await sleep(2000, signal)
           continue
         }
         if (st.kind === 'wait') {
-          await sleep(2000, deps.signal)
+          await sleep(2000, signal)
           continue
         }
         if (st.kind === 'expired') break
@@ -227,26 +228,27 @@ export function createWechatChannel(cfg, deps) {
       return true // iLink 无需预配置，扫码登录即可
     },
     async start() {
-      running = true
-      if (!(await login())) return
+      const myRun = ++runSeq
+      const signal = deps.signal // 局部捕获：重建时 deps.signal 会被替换
+      if (!(await login(signal))) return
       loggedIn = true
       deps.log.info('wechat: 登录完成，开始长轮询')
-      while (running && !deps.signal.aborted) {
+      while (myRun === runSeq && !signal.aborted) {
         // 心跳：watchdog 据此检测轮询停滞
-        deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:wechat')
+        deps.watchdog?.beat(deps.jobId?.value ?? 'dsh-relay:wechat')
         let page
         try {
           page = await client.getUpdates(cursor, Number(cfg.pollTimeoutSecs ?? 70))
         } catch (err) {
-          if (deps.signal.aborted) return
+          if (signal.aborted) return
           if (isTimeout(err)) continue
           deps.log.warn('wechat: 长轮询失败，5s 后重试:', err)
-          await sleep(5000, deps.signal)
+          await sleep(5000, signal)
           continue
         }
         cursor = page.cursor
         for (const msg of page.messages) {
-          if (deps.signal.aborted) return
+          if (signal.aborted) return
           if (msg.contextToken) deps.store.setWechatContextToken(msg.fromUserId, msg.contextToken)
           if (msg.fromUserId !== deps.store.wechatAllowedUser) continue
           deps.pushInbound({
@@ -259,7 +261,7 @@ export function createWechatChannel(cfg, deps) {
       }
     },
     async stop() {
-      running = false
+      runSeq += 1
       loggedIn = false
     },
     async send(text) {

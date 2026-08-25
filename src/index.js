@@ -660,6 +660,11 @@ export function apply(ctx, config = {}) {
   const startChannelJob = (channel) => {
     const controller = new AbortController()
     channelDeps[channel.id].signal = controller.signal
+    // jobs.start 会同步执行 run（channel.start 在那里启动），其返回的 jobId
+    // 只有 start 返回后才可知。poll 在 start() 内部循环时 beat 需要真实 jobId——
+    // 用闭包 jobIdRef：先填 undefined（首次 poll 可能拿不到，beat 有 ?? 兜底），
+    // start 返回后立即赋值，后续 poll 均读到真实 jobId。
+    const jobIdRef = { value: undefined }
     // ctx.jobs.start 返回真实 jobId（dsh-relay-N），watchdog 用它对接任务生命周期
     const jobId = jobs.start({
       kind: 'dsh-relay',
@@ -676,7 +681,8 @@ export function apply(ctx, config = {}) {
         }
       },
     })
-    channelDeps[channel.id].jobId = jobId // 通道 poll 里 watchdog.beat 用真实 jobId
+    jobIdRef.value = jobId
+    channelDeps[channel.id].jobId = jobIdRef // poll 里 beat(deps.jobId?.value ?? 兜底)
     channelRunners.set(channel.id, { controller, channel, jobId })
     return {
       jobId,
@@ -717,6 +723,10 @@ export function apply(ctx, config = {}) {
         log.warn('dsh-relay: watchdog 服务 2.5s 内未就绪，通道健康监控不可用（dsh-task-watchdog 未安装？）')
       }
     } else {
+      // 关键：把服务回填到通道 deps——channelDeps 在 apply 同步段取过
+      // ctx.get('watchdog')（可能 undefined，watchdog 尚未 provide），不回填的话
+      // poll 循环里的 watchdog?.beat 永远空转：监控只产生诊断、永远不会健康。
+      for (const id of Object.keys(channelDeps)) channelDeps[id].watchdog = watchdogSvc
       // 就绪后补注册已启动的通道
       for (const channel of channels) {
         if (channelActive(channel) && !channelRunners.get(channel.id)?.registered) {

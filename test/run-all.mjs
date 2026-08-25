@@ -12,6 +12,7 @@ const suites = [
   ['单元测试（路由/语义/编号/存储/脱敏/通道解析）', 'src/index.test.js'],
   ['dry-run 集成（审批/提问//relay 命令）', 'src/dryrun.test.js'],
   ['apply 冒烟（插件装载/监听注册）', 'src/apply.smoke.js'],
+  ['imessage poll dry-run（真实 chat.db 只读 + 重建竞态）', 'test/imessage-poll.dryrun.mjs'],
 ]
 
 let failed = 0

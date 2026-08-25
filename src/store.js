@@ -43,6 +43,8 @@ const emptyState = () => ({
   channelDiag: [],
   /** 合并窗口缓冲快照（崩溃恢复；flush 后删除）：channelId → senderId → parts */
   mergeBuffers: {},
+  /** 通道轮询活动脉冲（诊断：外部可确认 poll 是否真的在跑）：channelId → {count, lastAt, lastRowid?} */
+  channelPulse: {},
 })
 
 export class RelayStore {
@@ -77,6 +79,7 @@ export class RelayStore {
       if (raw.channelContexts && typeof raw.channelContexts === 'object') base.channelContexts = raw.channelContexts
       if (Array.isArray(raw.channelDiag)) base.channelDiag = raw.channelDiag
       if (raw.mergeBuffers && typeof raw.mergeBuffers === 'object') base.mergeBuffers = raw.mergeBuffers
+      if (raw.channelPulse && typeof raw.channelPulse === 'object') base.channelPulse = raw.channelPulse
       return base
     } catch {
       // 文件不存在或损坏：从空状态开始（损坏时宁可重来也不崩）
@@ -269,6 +272,21 @@ export class RelayStore {
 
   mergeBuffers() {
     return structuredClone(this.state.mergeBuffers)
+  }
+
+  // ---- 轮询活动脉冲（诊断） ----
+
+  /**
+   * 通道每轮 poll 调用一次：记录活动时间与计数器（外部据此判断轮询是否真的在跑，
+   * 不必依赖日志）。saveSoon 500ms 合并，5s 一轮的通道写入频率可接受。
+   */
+  touchPulse(channelId, rowid) {
+    const key = String(channelId)
+    const p = this.state.channelPulse[key] ??= { count: 0, lastAt: 0 }
+    p.count += 1
+    p.lastAt = Date.now()
+    if (rowid !== undefined) p.lastRowid = rowid
+    this.saveSoon()
   }
 
   // ---- 落盘 ----

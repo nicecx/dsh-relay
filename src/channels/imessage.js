@@ -191,7 +191,10 @@ export function createImessageChannel(cfg, deps) {
     }
   }
   let chatCache = []
-  let running = false
+  // 循环代际：每次 start 递增；stop 递增使旧循环失效。
+  // 不用共享 running 布尔：spawn 重建（watchdog 恢复）会先 stop() 再 start()，
+  // 共享布尔会让旧循环被新 start 重新"激活"而永不退出（僵尸 job）。
+  let runSeq = 0
   let lastChatRefresh = 0
   let lastTccWarnAt = 0
   /** 最近一条可信入站来自的会话（chat_identifier）：回执优先发回该会话 */
@@ -254,7 +257,11 @@ export function createImessageChannel(cfg, deps) {
       return process.platform === 'darwin' && handles.length > 0
     },
     async start() {
-      running = true
+      const myRun = ++runSeq
+      // 局部捕获 signal：watchdog 恢复会经 startChannelJob 重建通道（覆盖
+      // deps.signal 为新 controller）——若循环每次读 deps.signal，旧循环会
+      // 永远无法被自己 controller 的 abort 终止（读的是新信号），导致僵尸任务。
+      const signal = deps.signal
       // 水位 = 已处理过的最大 rowid（去重表里的最新一条），而不是启动时 MAX(ROWID)。
       // 这样停机/重启期间到达的消息（rowid 介于"最后处理"与"当前最大"之间）也会被补收，
       // 不会被启动水位误跳过。首次运行（无历史去重记录）才用 MAX(ROWID) 防历史冲刷。
@@ -283,14 +290,14 @@ export function createImessageChannel(cfg, deps) {
       } catch (err) {
         deps.log.warn('iMessage: 预解析会话失败（稍后重试）:', err)
       }
-      while (running && !deps.signal.aborted) {
-        await sleep(deps.pollSecs * 1000, deps.signal)
-        if (!running || deps.signal.aborted) return
-        await poll()
+      while (myRun === runSeq && !signal.aborted) {
+        await sleep(deps.pollSecs * 1000, signal)
+        if (myRun !== runSeq || signal.aborted) return
+        await poll(signal)
       }
     },
     async stop() {
-      running = false
+      runSeq += 1
     },
     async send(text) {
       // 优先发回"最近一条可信入站"的会话（回复对话语义）。chat_identifier 需加服务前缀
@@ -335,10 +342,12 @@ export function createImessageChannel(cfg, deps) {
     }
   }
 
-  async function poll() {
+  async function poll(signal) {
     if (handles.length === 0) return
     // 心跳：watchdog 据此检测轮询停滞
-    deps.watchdog?.beat(deps.jobId ?? 'dsh-relay:imessage')
+    deps.watchdog?.beat(deps.jobId?.value ?? 'dsh-relay:imessage')
+    // 活动脉冲（诊断）：外部可据此确认 poll 真的在跑（state.json channelPulse）
+    try { deps.store.touchPulse?.('imessage') } catch { /* 诊断字段非必需 */ }
     // 本轮实际处理（将交给 pushInbound）的消息 ROWID：cfg.markRead=true 时标注已读
     const processed = []
     // 系统 sqlite3 不支持位置参数绑定，句柄内联为转义后的字符串字面量；
@@ -370,7 +379,7 @@ export function createImessageChannel(cfg, deps) {
         return
       }
       for (const row of Array.isArray(rows) ? rows : []) {
-        if (deps.signal.aborted) return
+        if (signal.aborted) return
         const rowid = String(row.rowid ?? '')
         const sender = String(row.sender ?? '')
         if (rowid === '' || sender === '') continue
@@ -404,7 +413,7 @@ export function createImessageChannel(cfg, deps) {
         await markRead(processed)
       }
     } catch (err) {
-      if (deps.signal.aborted) return
+      if (signal.aborted) return
       const msg = String(err?.message ?? err)
       if (/authorization denied|Operation not permitted|not authorized/i.test(msg)) {
         // TCC 拒绝：节流告警（每 10 分钟最多一次），避免刷屏
