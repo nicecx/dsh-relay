@@ -14,7 +14,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { RelayStore } from '../src/store.js'
-import { createImessageChannel, normalizeMessageChatId, extractHandleFromChatId } from '../src/channels/imessage.js'
+import {
+  createImessageChannel, normalizeMessageChatId, extractHandleFromChatId,
+  buildSendAttempts, sendTargetOrder,
+} from '../src/channels/imessage.js'
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-relay-im-'))
 // 预填"上次运行处理到 37499"：验证停机期间 37500/37501 的补收（real 行为）而非首次运行跳过
@@ -69,6 +72,19 @@ check('extract: any;-;+86X → +86X', extractHandleFromChatId('any;-;+8615021614
 check('extract: iMessage;-;mail → mail', extractHandleFromChatId('iMessage;-;nicecx@msn.com') === 'nicecx@msn.com')
 check('extract: 裸 handle 原样', extractHandleFromChatId('nicecx@icloud.com') === 'nicecx@icloud.com')
 
+// ---- 阶段 0b：发送路由固化（2026-08-25 实测矩阵：buddy 唯一稳定，chat id 回退）----
+const attempts = buildSendAttempts('any;-;+8615021614862')
+check('发送序列: buddy handle 正确', attempts.buddyHandle === '+8615021614862')
+check('发送序列: chat id 回退优先 iMessage;-;', attempts.idAttempts[0] === 'iMessage;-;+8615021614862')
+check('发送序列: 再回退原样', attempts.idAttempts[1] === 'any;-;+8615021614862')
+const attempts2 = buildSendAttempts('iMessage;-;nicecx@msn.com')
+check('发送序列: 已是 iMessage;-; 只回退一次', attempts2.idAttempts.length === 1 && attempts2.idAttempts[0] === 'iMessage;-;nicecx@msn.com')
+const order = sendTargetOrder(['nicecx@msn.com', 'nicecx@icloud.com', '+8615021614862'], '+8615021614862')
+check('目标优先级: 最近入站会话第一', order[0]?.chatId === 'any;-;+8615021614862' && order[0]?.label === '原会话')
+check('目标优先级: 手机号 handle 第二', order[1]?.chatId === 'iMessage;-;+8615021614862' && order[1]?.label === '手机号')
+const orderNoInbound = sendTargetOrder(['nicecx@msn.com', '+8615021614862'], '')
+check('目标优先级: 无入站时手机号优先', orderNoInbound.length === 1 && orderNoInbound[0]?.chatId === 'iMessage;-;+8615021614862')
+
 // ---- 阶段 1：首次 start，跑 4 轮 poll（约 1s）----
 const c1 = new AbortController()
 deps.signal = c1.signal
@@ -93,9 +109,11 @@ check('重建后新循环继续 poll（脉冲增长）', pulse2 > 0, `count=${pu
 // （c1 是旧循环的 signal；abort 后新循环（读 c2.signal）应继续）
 c1.abort()
 const before = store.state.channelPulse?.imessage?.count ?? 0
+const p1Settled = await Promise.race([p1.then(() => true, () => true), sleep(1500).then(() => false)])
 await sleep(1500)
 const after = store.state.channelPulse?.imessage?.count ?? 0
 check('abort 旧 controller 后新循环不受影响（仍在 poll）', after > before, `before=${before} after=${after}`)
+check('abort 旧 controller 后旧循环已退出（无僵尸，start() 已 settle）', p1Settled === true)
 
 // ---- 阶段 4：正常停止 ----
 const c3 = new AbortController()

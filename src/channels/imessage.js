@@ -55,6 +55,34 @@ export function extractHandleFromChatId(id) {
   return String(id ?? '').replace(/^(any|iMessage|SMS);-;/, '')
 }
 
+/**
+ * 发送尝试序列（2026-08-25 实测路由矩阵固化）：
+ * 1. buddy 形式（macOS 26 上唯一稳定正确：`send to buddy H of (first service whose service type is iMessage)`）
+ * 2. chat id 形式回退（any;-;X 的旧行为，部分环境/目标仍可用；先 iMessage;-;X 后原样）
+ * 返回 { buddyHandle, idAttempts }。纯函数，供 sendAppleScript 与单测使用。
+ */
+export function buildSendAttempts(rawChatId) {
+  const raw = String(rawChatId ?? '')
+  if (raw === '') return { buddyHandle: '', idAttempts: [] }
+  const normalized = normalizeMessageChatId(raw)
+  const idAttempts = normalized === raw ? [raw] : [normalized, raw]
+  return { buddyHandle: extractHandleFromChatId(raw), idAttempts }
+}
+
+/**
+ * send() 的目标优先级（2026-08-25 实测调整）：
+ *   1. 最近可信入站所在会话（用户刚回复在哪，回执回哪）
+ *   2. 白名单 +86 手机号 handle（移动端可见会话优先）
+ * 返回 [{label, chatId}]。fallback（findChats/chat.db）由调用方追加。纯函数，供单测。
+ */
+export function sendTargetOrder(handles, lastInboundChat) {
+  const out = []
+  if (lastInboundChat) out.push({ label: '原会话', chatId: `any;-;${lastInboundChat}` })
+  const phone = (handles ?? []).filter((h) => /^\+\d{5,}$/.test(String(h)))
+  for (const h of phone) out.push({ label: '手机号', chatId: `iMessage;-;${h}` })
+  return out
+}
+
 /** 忽略以这些前缀开头的消息（其他机器人的消息，如 【ops-agent】） */
 const DEFAULT_IGNORE_PREFIXES = ['【']
 
@@ -253,12 +281,10 @@ export function createImessageChannel(cfg, deps) {
     return id || undefined
   }
 
-  /**
-   * 通过 AppleScript 发送到指定目标（附加自标记防回灌）
-   */
+  /** 通过 AppleScript 发送到指定目标（附加自标记防回灌） */
   async function sendAppleScript(text, chatId) {
-    const raw = String(chatId ?? '')
-    if (raw === '') throw new Error('iMessage: 空 chat id')
+    const { buddyHandle, idAttempts } = buildSendAttempts(chatId)
+    if (buddyHandle === '') throw new Error('iMessage: 空 chat id')
     // 首选 buddy 形式（2026-08-25 实测）：macOS 26 上 `send to chat id "X;-;H"` 时好时坏
     // （any;-;+8615021614862 落错到 msn 自我会话、iMessage;-; 常报 -1728 且不发送），
     // 而 `send to buddy H of (first service whose service type is iMessage)` 对
@@ -274,14 +300,13 @@ export function createImessageChannel(cfg, deps) {
       'end run',
     ]
     try {
-      await runAppleScript(buddyScript, [`${text}${SELF_MARKER}`, extractHandleFromChatId(raw)])
+      await runAppleScript(buddyScript, [`${text}${SELF_MARKER}`, buddyHandle])
       return
     } catch (err) {
       deps.log.debug('iMessage: buddy 形式发送失败（%s），回退 chat id 形式', err?.message ?? err)
     }
-    const candidates = normalizeMessageChatId(raw) === raw ? [raw] : [normalizeMessageChatId(raw), raw]
     let lastErr
-    for (const id of candidates) {
+    for (const id of idAttempts) {
       const script = [
         'on run argv',
         '  set msg to item 1 of argv',
@@ -354,11 +379,11 @@ export function createImessageChannel(cfg, deps) {
       runSeq += 1
     },
     async send(text) {
-      // 目标优先级（2026-08-25 实测后调整）：
-      //   1. 最近一条可信入站所在的会话（用户刚回复在哪里，回执回哪里）
+      // 目标优先级（sendTargetOrder，纯函数）：
+      //   1. 最近可信入站所在的会话（用户刚回复在哪里，回执回哪里）
       //   2. 白名单里的 +86 手机号 handle（移动端可见会话，手机是第一现场）
       //   3. AppleScript findChats / chat.db 兜底
-      // 所有形式都经 sendAppleScript 规范化（any;-;X → 优先 iMessage;-;X）。
+      // 所有形式都经 sendAppleScript 的 buddy 优先路由（macOS 26 实测）。
       const trySendOne = async (label, rawChatId) => {
         try {
           await sendAppleScript(text, rawChatId)
@@ -368,10 +393,8 @@ export function createImessageChannel(cfg, deps) {
           return false
         }
       }
-      if (lastInboundChat && (await trySendOne('原会话', `any;-;${lastInboundChat}`))) return
-      const phoneHandles = handles.filter((h) => /^\+\d{5,}$/.test(h))
-      for (const h of phoneHandles) {
-        if (await trySendOne('手机号', `iMessage;-;${h}`)) return
+      for (const { label, chatId } of sendTargetOrder(handles, lastInboundChat)) {
+        if (await trySendOne(label, chatId)) return
       }
       const fallback = await resolveSendTarget()
       if (fallback === undefined) {
