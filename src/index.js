@@ -699,11 +699,38 @@ export function apply(ctx, config = {}) {
   // 每个通道在 poll 循环里调用 deps.watchdog.beat(channel.id) 上报心跳；
   // 停滞/启动失败由 watchdog 插件统一诊断、自动重启、失败告警。
   // 本插件不再内置 watchdog 逻辑（单一职责，见 README 推荐）。
-  const watchdogSvc = ctx.get('watchdog')
+  // 注意：watchdog 是可选依赖（ctx.get），dsh-relay 可能先于它 apply——
+  // 因此延迟到事件循环后获取，并支持短暂重试（cordis 插件按 inject 依赖解析，
+  // 不依赖 watchdog 的行会先执行，需等 watchdog 的 provide 完成）。
+  let watchdogSvc = undefined
+  const acquireWatchdog = () => {
+    watchdogSvc = ctx.get('watchdog')
+    try {
+      store.state.watchdogConnected = watchdogSvc !== undefined
+      store.saveSoon()
+    } catch { /* 忽略 */ }
+    if (watchdogSvc === undefined) {
+      // 未就绪：500ms 后重试（最多 5 次 = 2.5s，通常 watchdog 在此窗口内 apply）
+      if ((acquireWatchdog.retries = (acquireWatchdog.retries ?? 0) + 1) <= 5) {
+        setTimeout(acquireWatchdog, 500)
+      } else {
+        log.warn('dsh-relay: watchdog 服务 2.5s 内未就绪，通道健康监控不可用（dsh-task-watchdog 未安装？）')
+      }
+    } else {
+      // 就绪后补注册已启动的通道
+      for (const channel of channels) {
+        if (channelActive(channel) && !channelRunners.get(channel.id)?.registered) {
+          registerChannelToWatchdog(channel)
+        }
+      }
+    }
+  }
+  setTimeout(acquireWatchdog, 0)
 
   /** 把单个通道注册到 watchdog（启动循环与「开启通道」命令共用） */
   const registerChannelToWatchdog = (channel) => {
     if (watchdogSvc === undefined) return
+    if (channelRunners.get(channel.id)?.registered) return // 已注册防重复
     const runner = channelRunners.get(channel.id)
     const jobId = runner?.jobId
     if (!jobId) {
@@ -745,16 +772,12 @@ export function apply(ctx, config = {}) {
       },
     })
     disposers.push(unreg)
+    // 标记已注册（spawn 重建后 startChannelJob 会创建新 runner，registered 随新 runner 重置）
+    if (channelRunners.get(channel.id)) channelRunners.get(channel.id).registered = true
   }
 
-  if (watchdogSvc !== undefined) {
-    for (const channel of channels) {
-      if (channelActive(channel)) registerChannelToWatchdog(channel)
-    }
-    log.info('dsh-relay: 已注册 %s 个通道到 watchdog 服务', channels.filter(channelActive).length)
-  } else {
-    log.warn('dsh-relay: 未找到 watchdog 服务（dsh-task-watchdog 未安装？），通道健康监控不可用')
-  }
+  // 通道注册到 watchdog 由 acquireWatchdog（延迟获取服务）统一触发，
+  // 不再在 apply 同步段注册（watchdog 可能尚未 provide）。
 
   // ---- /relay 命令（网页命令输入行：罗列未回复诉求/状态） ----
 

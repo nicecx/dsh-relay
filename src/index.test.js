@@ -421,7 +421,7 @@ t('router: 模糊语意-列出对话（会话/对话通用）', () => {
   assert.equal(routeText('当前对话').kind, 'chat') // 有歧义，不误判为列表
 })
 
-import { chatInScope } from './channels/imessage.js'
+import { chatInScope, createImessageChannel } from './channels/imessage.js'
 
 t('imessage: 通用会话范围 chatScope（空=全部，子串匹配）', () => {
   assert.equal(chatInScope('any;-;you@msn.com', ''), true)          // 空 scope = 全部
@@ -429,6 +429,20 @@ t('imessage: 通用会话范围 chatScope（空=全部，子串匹配）', () =>
   assert.equal(chatInScope('any;-;you@icloud.com', 'you@icloud.com'), true)
   assert.equal(chatInScope('any;-;+8613800000000', '+8613800000000'), true)
   assert.equal(chatInScope('any;-;+8613800000000', '+86'), true)        // 前缀/子串
+})
+
+t('imessage: 安全守卫——通配/全放行白名单被拒绝', () => {
+  const deps = { store: {}, log: { info(){}, warn(){}, debug(){} } }
+  // 通配符
+  assert.throws(() => createImessageChannel({ handle: '*', chatScope: '' }, deps), /危险/)
+  assert.throws(() => createImessageChannel({ handle: 'any', chatScope: '' }, deps), /危险/)
+  assert.throws(() => createImessageChannel({ extraHandles: ['*@example.com'], chatScope: '' }, deps), /危险/)
+  // 空 handle + 空 extraHandles → handles 空，configured 应 false（通道不启动）
+  const ch = createImessageChannel({ handle: '', extraHandles: [], chatScope: '' }, deps)
+  assert.equal(ch.configured(), false, '未配置白名单不启动')
+  // 合法具体身份不抛错
+  const ok = createImessageChannel({ handle: 'you@msn.com', extraHandles: ['+8613800000000'], chatScope: '' }, deps)
+  assert.equal(ok.configured(), true, '具体白名单正常配置')
 })
 
 t('imessage: buildFindChatSql 空 scope 收全部会话（手机号+msn 都能找到）', () => {

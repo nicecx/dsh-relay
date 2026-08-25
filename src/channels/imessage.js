@@ -181,6 +181,15 @@ export function createImessageChannel(cfg, deps) {
     ...(cfg.handle ? [String(cfg.handle)] : []),
     ...(Array.isArray(cfg.extraHandles) ? cfg.extraHandles.map(String) : []),
   ])
+  // ⚠️ 安全守卫（配置时的安全原则）：白名单必须明确列出具体身份。
+  // 拒绝通配/全放行形式（'*'、'any'、空串被当白名单），防止误配置导致任意人都能驱动审批。
+  const DANGEROUS = ['*', 'any', 'all', 'everyone', '']
+  for (const h of handles) {
+    const low = h.toLowerCase()
+    if (DANGEROUS.includes(low) || low.includes('*')) {
+      throw new Error(`imessage: 白名单配置危险（不允许 "${h}"——必须列出具体手机号/邮箱）`)
+    }
+  }
   let chatCache = []
   let running = false
   let lastChatRefresh = 0
@@ -240,6 +249,8 @@ export function createImessageChannel(cfg, deps) {
     id: 'imessage',
     label: 'iMessage',
     configured() {
+      // 安全原则：白名单必须显式配置且最小化——handle/extraHandles 至少一个具体身份，
+      // 且不得用通配/全放行形式（配置时明确列出的才是可信发送者，绝不放"任意人"进白名单）。
       return process.platform === 'darwin' && handles.length > 0
     },
     async start() {
