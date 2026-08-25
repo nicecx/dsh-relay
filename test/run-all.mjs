@@ -13,6 +13,7 @@ const suites = [
   ['dry-run 集成（审批/提问//relay 命令）', 'src/dryrun.test.js'],
   ['apply 冒烟（插件装载/监听注册）', 'src/apply.smoke.js'],
   ['imessage poll dry-run（真实 chat.db 只读 + 重建竞态）', 'test/imessage-poll.dryrun.mjs'],
+  ['环境自检（只读：TCC/osascript/buddy/活性；--send 才真实发送）', 'test/env-check.mjs'],
 ]
 
 let failed = 0
