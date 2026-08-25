@@ -50,6 +50,11 @@ export function normalizeMessageChatId(id) {
   return `iMessage;-;${s.replace(/^any;-;/, '')}`
 }
 
+/** chat id → handle（AppleScript buddy 发送目标用）：`any;-;X`/`iMessage;-;X`/`SMS;-;X` → X；其他形式原样返回 */
+export function extractHandleFromChatId(id) {
+  return String(id ?? '').replace(/^(any|iMessage|SMS);-;/, '')
+}
+
 /** 忽略以这些前缀开头的消息（其他机器人的消息，如 【ops-agent】） */
 const DEFAULT_IGNORE_PREFIXES = ['【']
 
@@ -248,11 +253,32 @@ export function createImessageChannel(cfg, deps) {
     return id || undefined
   }
 
-  /** 通过 AppleScript 发送到指定 chat id（附加自标记防回灌） */
+  /**
+   * 通过 AppleScript 发送到指定目标（附加自标记防回灌）
+   */
   async function sendAppleScript(text, chatId) {
     const raw = String(chatId ?? '')
     if (raw === '') throw new Error('iMessage: 空 chat id')
-    // 规范化优先：any;-;X → iMessage;-;X（实测后者可靠），失败回退原样
+    // 首选 buddy 形式（2026-08-25 实测）：macOS 26 上 `send to chat id "X;-;H"` 时好时坏
+    // （any;-;+8615021614862 落错到 msn 自我会话、iMessage;-; 常报 -1728 且不发送），
+    // 而 `send to buddy H of (first service whose service type is iMessage)` 对
+    // 手机号/邮箱目标全部稳定且落点正确。失败回退 chat id 形式（历史兼容）。
+    const buddyScript = [
+      'on run argv',
+      '  set msg to item 1 of argv',
+      '  set target to item 2 of argv',
+      '  tell application "Messages"',
+      '    set svc to first service whose service type is iMessage',
+      '    send msg to buddy target of svc',
+      '  end tell',
+      'end run',
+    ]
+    try {
+      await runAppleScript(buddyScript, [`${text}${SELF_MARKER}`, extractHandleFromChatId(raw)])
+      return
+    } catch (err) {
+      deps.log.debug('iMessage: buddy 形式发送失败（%s），回退 chat id 形式', err?.message ?? err)
+    }
     const candidates = normalizeMessageChatId(raw) === raw ? [raw] : [normalizeMessageChatId(raw), raw]
     let lastErr
     for (const id of candidates) {

@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { RelayStore } from '../src/store.js'
-import { createImessageChannel, normalizeMessageChatId } from '../src/channels/imessage.js'
+import { createImessageChannel, normalizeMessageChatId, extractHandleFromChatId } from '../src/channels/imessage.js'
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-relay-im-'))
 // 预填"上次运行处理到 37499"：验证停机期间 37500/37501 的补收（real 行为）而非首次运行跳过
@@ -60,11 +60,14 @@ const check = (name, cond, extra = '') => {
   }
 }
 
-// ---- 阶段 0：chat id 规范化（2026-08-25 实测：any;-;X 落错会话，iMessage;-;X 正确）----
+// ---- 阶段 0：chat id 规范化与 buddy handle 提取（2026-08-25 实测）----
 check('normalize: any;-;X → iMessage;-;X', normalizeMessageChatId('any;-;+8615021614862') === 'iMessage;-;+8615021614862')
 check('normalize: iMessage;-;X 保持原样', normalizeMessageChatId('iMessage;-;nicecx@msn.com') === 'iMessage;-;nicecx@msn.com')
 check('normalize: SMS;-;X 保持原样', normalizeMessageChatId('SMS;-;+8615021614862') === 'SMS;-;+8615021614862')
 check('normalize: 空串安全', normalizeMessageChatId('') === '')
+check('extract: any;-;+86X → +86X', extractHandleFromChatId('any;-;+8615021614862') === '+8615021614862')
+check('extract: iMessage;-;mail → mail', extractHandleFromChatId('iMessage;-;nicecx@msn.com') === 'nicecx@msn.com')
+check('extract: 裸 handle 原样', extractHandleFromChatId('nicecx@icloud.com') === 'nicecx@icloud.com')
 
 // ---- 阶段 1：首次 start，跑 4 轮 poll（约 1s）----
 const c1 = new AbortController()
