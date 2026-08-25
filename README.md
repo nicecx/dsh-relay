@@ -227,3 +227,9 @@ node cli.js list    # 命令行罗列待回复诉求
 ## License
 
 MIT
+
+## 测试与覆盖
+
+- **测试**：`npm test`（统一运行器 `test/run-all.mjs`：dry-run / env-check / 契约）
+- **覆盖矩阵与质量检测基线**：[`test/DRYRUN.md`](test/DRYRUN.md)（正向推演：功能规格 → 测试设计技术 → 规模层 → 风险 → 断言 → 回归实证；含 c8 覆盖率快照与盲区标注）
+- **覆盖率复测**：`npm run coverage`（c8 text-summary；数字变化时请同步更新 DRYRUN.md）
