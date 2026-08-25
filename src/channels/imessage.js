@@ -36,6 +36,20 @@ const CHAT_DB = join(homedir(), 'Library', 'Messages', 'chat.db')
 /** 本插件出站消息的不可见自标记：轮询据此排除自己的推送（防止回灌成命令） */
 export const SELF_MARKER = '\u200bD5HR42'
 
+/**
+ * AppleScript chat id 规范化（2026-08-25 实测修因）：
+ * `send msg to chat id "any;-;X"` 会落入"参与者=X"的会话——实测
+ * any;-;+8615021614862 的发送落到了 nicecx@msn.com 自我会话（手机收不到）；
+ * `iMessage;-;X`（X=邮箱或 +86 手机号）可靠落到 chat_identifier=X 的会话，
+ * 无既有会话时也能正确创建。规范化：any;-;X → 优先 iMessage;-;X。
+ */
+export function normalizeMessageChatId(id) {
+  const s = String(id ?? '').trim()
+  if (!s) return s
+  if (/^(iMessage|SMS);-;/.test(s)) return s
+  return `iMessage;-;${s.replace(/^any;-;/, '')}`
+}
+
 /** 忽略以这些前缀开头的消息（其他机器人的消息，如 【ops-agent】） */
 const DEFAULT_IGNORE_PREFIXES = ['【']
 
@@ -236,16 +250,30 @@ export function createImessageChannel(cfg, deps) {
 
   /** 通过 AppleScript 发送到指定 chat id（附加自标记防回灌） */
   async function sendAppleScript(text, chatId) {
-    const script = [
-      'on run argv',
-      '  set msg to item 1 of argv',
-      '  set cid to item 2 of argv',
-      '  tell application "Messages"',
-      '    send msg to chat id cid',
-      '  end tell',
-      'end run',
-    ]
-    await runAppleScript(script, [`${text}${SELF_MARKER}`, chatId])
+    const raw = String(chatId ?? '')
+    if (raw === '') throw new Error('iMessage: 空 chat id')
+    // 规范化优先：any;-;X → iMessage;-;X（实测后者可靠），失败回退原样
+    const candidates = normalizeMessageChatId(raw) === raw ? [raw] : [normalizeMessageChatId(raw), raw]
+    let lastErr
+    for (const id of candidates) {
+      const script = [
+        'on run argv',
+        '  set msg to item 1 of argv',
+        '  set cid to item 2 of argv',
+        '  tell application "Messages"',
+        '    send msg to chat id cid',
+        '  end tell',
+        'end run',
+      ]
+      try {
+        await runAppleScript(script, [`${text}${SELF_MARKER}`, id])
+        return
+      } catch (err) {
+        lastErr = err
+        deps.log.debug('iMessage: 发送到 chat id %s 失败，尝试备用形式', id)
+      }
+    }
+    throw lastErr
   }
 
   return {
@@ -300,25 +328,31 @@ export function createImessageChannel(cfg, deps) {
       runSeq += 1
     },
     async send(text) {
-      // 优先发回"最近一条可信入站"的会话（回复对话语义）。chat_identifier 需加服务前缀
-      // 构造成 chat id（any;-;xxx）；若 Messages 不认该会话（如手机号会话被隐藏），
-      // 回退默认发送目标（resolveSendTarget 的 msn.com 会话）。
-      let chatId = lastInboundChat ? `any;-;${lastInboundChat}` : undefined
-      let sent = false
-      if (chatId) {
+      // 目标优先级（2026-08-25 实测后调整）：
+      //   1. 最近一条可信入站所在的会话（用户刚回复在哪里，回执回哪里）
+      //   2. 白名单里的 +86 手机号 handle（移动端可见会话，手机是第一现场）
+      //   3. AppleScript findChats / chat.db 兜底
+      // 所有形式都经 sendAppleScript 规范化（any;-;X → 优先 iMessage;-;X）。
+      const trySendOne = async (label, rawChatId) => {
         try {
-          await sendAppleScript(text, chatId)
-          sent = true
+          await sendAppleScript(text, rawChatId)
+          return true
         } catch (err) {
-          deps.log.warn('iMessage: 发回原会话 %s 失败（%s），回退默认目标', lastInboundChat, err?.message ?? err)
+          deps.log.warn('iMessage: 发送到 %s（%s）失败（%s），尝试下一目标', label, rawChatId, err?.message ?? err)
+          return false
         }
       }
-      if (!sent) {
-        const fallback = await resolveSendTarget()
-        if (fallback === undefined) {
-          throw new Error('iMessage: 无可用会话（请先给本机发一条 iMessage）')
-        }
-        await sendAppleScript(text, fallback)
+      if (lastInboundChat && (await trySendOne('原会话', `any;-;${lastInboundChat}`))) return
+      const phoneHandles = handles.filter((h) => /^\+\d{5,}$/.test(h))
+      for (const h of phoneHandles) {
+        if (await trySendOne('手机号', `iMessage;-;${h}`)) return
+      }
+      const fallback = await resolveSendTarget()
+      if (fallback === undefined) {
+        throw new Error('iMessage: 无可用会话（请先给本机发一条 iMessage）')
+      }
+      if (!(await trySendOne('默认目标', fallback))) {
+        throw new Error(`iMessage: 所有会话均发送失败（最后目标 ${fallback}）`)
       }
     },
     isTrusted(senderId) {

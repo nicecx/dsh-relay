@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { RelayStore } from '../src/store.js'
-import { createImessageChannel } from '../src/channels/imessage.js'
+import { createImessageChannel, normalizeMessageChatId } from '../src/channels/imessage.js'
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-relay-im-'))
 // 预填"上次运行处理到 37499"：验证停机期间 37500/37501 的补收（real 行为）而非首次运行跳过
@@ -60,12 +60,18 @@ const check = (name, cond, extra = '') => {
   }
 }
 
+// ---- 阶段 0：chat id 规范化（2026-08-25 实测：any;-;X 落错会话，iMessage;-;X 正确）----
+check('normalize: any;-;X → iMessage;-;X', normalizeMessageChatId('any;-;+8615021614862') === 'iMessage;-;+8615021614862')
+check('normalize: iMessage;-;X 保持原样', normalizeMessageChatId('iMessage;-;nicecx@msn.com') === 'iMessage;-;nicecx@msn.com')
+check('normalize: SMS;-;X 保持原样', normalizeMessageChatId('SMS;-;+8615021614862') === 'SMS;-;+8615021614862')
+check('normalize: 空串安全', normalizeMessageChatId('') === '')
+
 // ---- 阶段 1：首次 start，跑 4 轮 poll（约 1s）----
 const c1 = new AbortController()
 deps.signal = c1.signal
 const t0 = Date.now()
 const p1 = channel.start()
-await sleep(1100)
+await sleep(3500)
 const inboundIds = inbound.map((m) => m.messageId)
 check('start 后 poll 至少跑起来（有活动脉冲）', (store.state.channelPulse?.imessage?.count ?? 0) > 0, `pulse=${store.state.channelPulse?.imessage?.count}`)
 check('poll 期间收到真实入站消息（按 chat.db）', inbound.length > 0, `inbound=${JSON.stringify(inboundIds.slice(0, 5))}`)
@@ -76,7 +82,7 @@ channel.stop()
 const c2 = new AbortController()
 deps.signal = c2.signal
 const p2 = channel.start()
-await sleep(900)
+await sleep(2000)
 const pulse2 = store.state.channelPulse?.imessage?.count ?? 0
 check('重建后新循环继续 poll（脉冲增长）', pulse2 > 0, `count=${pulse2}`)
 
@@ -84,7 +90,7 @@ check('重建后新循环继续 poll（脉冲增长）', pulse2 > 0, `count=${pu
 // （c1 是旧循环的 signal；abort 后新循环（读 c2.signal）应继续）
 c1.abort()
 const before = store.state.channelPulse?.imessage?.count ?? 0
-await sleep(700)
+await sleep(1500)
 const after = store.state.channelPulse?.imessage?.count ?? 0
 check('abort 旧 controller 后新循环不受影响（仍在 poll）', after > before, `before=${before} after=${after}`)
 
@@ -92,7 +98,7 @@ check('abort 旧 controller 后新循环不受影响（仍在 poll）', after > 
 const c3 = new AbortController()
 deps.signal = c3.signal
 const p3 = channel.start()
-await sleep(500)
+await sleep(800)
 channel.stop()
 await p3 // start 循环应正常退出（不挂起）
 check('stop() 后 start 循环正常退出', true)
