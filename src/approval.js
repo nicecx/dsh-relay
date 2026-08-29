@@ -29,8 +29,9 @@ export function attachApprovalRelay(ctx, relay) {
       ].join('\n')
       relay.pushAll(prompt, { number, kind: 'approval', sessionId })
 
-      // 双轨：通道裁决（register 挂起等通道回复，优先） vs 网页裁决（next 显示+挂起，兜底）。
-      // 通道回复立即生效（手机批准有效）；网页仅作可见性与兜底（通道超时后网页可批）。
+      // 双轨并行：通道裁决（手机回复）与网页裁决（api-proxy next 挂起）**同时等待**，
+      // Promise.race 谁先到用谁——手机批立即生效，网页批也立即生效（不再"通道优先"，
+      // 修复 2026-08-25：手机收到推送但网页看不到/批不了的感知问题）。
       const channelVerdict = relay.requests.register({
         number,
         kind: 'approval',
@@ -43,19 +44,31 @@ export function attachApprovalRelay(ctx, relay) {
         .then((outcome) => ({ source: 'web', outcome }))
         .catch(() => ({ source: 'web', outcome: undefined }))
 
-      // 通道优先：等通道裁决；通道 settle（含超时）前不理会网页。
-      // 网页显示由 next() 挂起承载（api-proxy 挂起等网页用户，不返回）。
-      const channelResult = await channelVerdict
+      const settled = await Promise.race([
+        channelVerdict.then((verdict) => ({ source: 'channel', verdict })),
+        webOutcome,
+      ])
 
-      if (channelResult === 'allow') return 'allowed-once'
-      if (channelResult === 'reject') return 'rejected'
+      const doneOf = (outcome) => ({ 'allowed-once': '✅ 已在电脑端批准', rejected: '❌ 已在电脑端拒绝', cancelled: '⏹ 已在电脑端取消' }[outcome])
 
-      // 通道超时/中止：网页侧仍在显示挂起（next 已调用），用户可在网页批准/拒绝。
-      // 等网页裁决（用户点或 req.signal abort）。
-      const web = await webOutcome
-      const outcome = web.outcome
-      const done = { 'allowed-once': '✅ 已在电脑端批准', rejected: '❌ 已在电脑端拒绝', cancelled: '⏹ 已在电脑端取消' }[outcome]
+      if (settled.source === 'channel') {
+        const verdict = settled.verdict
+        if (verdict === 'allow') return 'allowed-once'
+        if (verdict === 'reject') return 'rejected'
+        // 通道超时/中止（undefined）→ 网页裁决兜底（挂起中，用户仍可批）
+        const web = await webOutcome
+        const outcome = web.outcome
+        const done = doneOf(outcome)
+        if (done) relay.pushAll(`#${number} ${done}`, { number, kind: 'approval', sessionId })
+        return outcome ?? 'unavailable'
+      }
+      // 网页先裁决：立即生效 + 结算通道侧（手机晚到不会被误报"不存在/过期"）
+      const outcome = settled.outcome
+      const done = doneOf(outcome)
       if (done) relay.pushAll(`#${number} ${done}`, { number, kind: 'approval', sessionId })
+      if (outcome === 'allowed-once') relay.requests.answer(number, 'allow')
+      else if (outcome === 'rejected') relay.requests.answer(number, 'reject')
+      else relay.requests.answer(number, undefined)
       return outcome ?? 'unavailable'
     },
     { prepend: true, global: true },

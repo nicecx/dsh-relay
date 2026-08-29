@@ -427,10 +427,11 @@ export function apply(ctx, config = {}) {
       .slice(0, 40)
       .map((r) => {
         const title = titles.get(r.id) || (live.get(r.id) ? sessionTitle(live.get(r.id)) : '')
-        return `${r.id}\t${title || '（无标题）'}\t${store.sessionEnabled(r.id) ? '开' : '关'}${r.live ? '\t●活跃' : ''}`
+        const short = r.id.replace(/^session-/, '').slice(0, 8)
+        return `${short}\t${title || '（无标题）'}\t${store.sessionEnabled(r.id) ? '开' : '关'}${r.live ? '\t●活跃' : ''}`
       })
     if (lines.length === 0) lines.push('（无会话）')
-    return ['会话列表（id\t标题\t开关\t状态）：', ...lines, rows.length > 40 ? `…共 ${rows.length} 个会话，仅显示前 40` : ''].filter(Boolean).join('\n')
+    return ['会话列表（短id\t标题\t开关\t状态）——「绑定会话 <短id>」即可切换：', ...lines, rows.length > 40 ? `…共 ${rows.length} 个会话，仅显示前 40` : ''].filter(Boolean).join('\n')
   }
 
   /** 通道内 /sessions 回复：按策略隔离（默认只给数量+指引，不暴露 id/标题） */

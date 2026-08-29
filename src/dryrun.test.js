@@ -362,6 +362,7 @@ t('turnEndPush: 默认关闭 → 不推送', async () => {
 t('turnEndPush: 开启 → 推送且片段 ≤120 字', async () => {
   const ctx = fakeCtx()
   const store = new RelayStore(storePath)
+  store.setBoundSession('imessage', 's1') // 2026-08-28: turnpush 只推绑定会话(连续对话模式),用例需先绑定
   const pushed = []
   const relay = {
     store,
@@ -565,9 +566,13 @@ const lh = testHooks.get(listCtx)
 
 t('/sessions：列出全部会话（含非活跃），标题与活跃标记', async () => {
   const r = await lh.dispatch('/sessions', 'imessage', 'sender')
-  assert.ok(r.includes('session-aaaaaaaa-0000-4000-8000-000000000002'), '应包含非活跃会话')
+  // 2026-08-27 起输出短 id（session- 前缀去除 + 前 8 字符），通道内不暴露完整 id；
+  // 非活跃会话 0002 无标题快照 → 以「（无标题）」行 + 无 ●活跃 标记为特征
+  assert.ok(r.includes('（无标题）'), '应包含非活跃会话（无标题快照行）')
   assert.ok(r.includes('活跃对话'), '应包含标题')
   assert.ok(r.includes('●活跃'), '应标注活跃')
+  const rows = r.split('\n').filter((l) => l.includes('\t') && !l.startsWith('会话列表'))
+  assert.equal(rows.length, 2, '应列出全部会话（活跃 + 非活跃共 2 行）')
 })
 
 // ---------- 重启后遗留诉求：应答必须有回执（不沉默） ----------
