@@ -16,7 +16,7 @@
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync } from 'node:fs'
 import { RelayStore } from './store.js'
 import { RequestRegistry } from './requests.js'
 import { routeText, HELP } from './router.js'
@@ -30,12 +30,14 @@ import { createImessageChannel } from './channels/imessage.js'
 import { createEmailChannel } from './channels/email.js'
 import { createWechatChannel } from './channels/wechat.js'
 import { attachTurnEndRelay } from './turnpush.js'
+import { createInboxService, scanSessionRegistry, INBOX_GUARDRAIL, AUDIT_FILE } from './inbox.js'
 
 export const name = 'dsh-relay'
 
 /** 测试钩子：apply 后可用 testHooks.get(ctx) 取到 { dispatch, store, requests }（仅测试用） */
 export const testHooks = new WeakMap()
-export const inject = ['agents', 'jobs', 'sessions']
+export const inject = ['agents', 'jobs', 'sessions', 'tools']
+apply.inject = ['agents', 'jobs', 'sessions', 'tools']
 
 const LAST_TEXT_SNIPPET_CHARS = 600
 const LONG_INPUT_ACK_CHARS = 180
@@ -50,6 +52,10 @@ const DEFAULTS = {
   emailPollSecs: 20,
   statePath: '',
   channels: {},
+  /** 会话间 inbox（session-inbox）：会话间轻量消息渠道（session_send 工具 + 轮询投递） */
+  inboxEnabled: true,
+  inboxPollSecs: 5,
+  inboxMaxBytes: 1024 * 1024,
   /** 通道内 /sessions 回复策略：pointer=只给数量+指引（默认，防暴露）；full=完整列表；silent=不回复 */
   sessionsInChannel: 'pointer',
   /** 安全开关：允许文本注入 / 外发脱敏 */
@@ -790,6 +796,158 @@ export function apply(ctx, config = {}) {
   // 通道注册到 watchdog 由 acquireWatchdog（延迟获取服务）统一触发，
   // 不再在 apply 同步段注册（watchdog 可能尚未 provide）。
 
+  // ---- 会话间 inbox（session-inbox，20260902-020 设计落地）----
+  // DSH 会话间轻量消息：session_send 工具写入 <target>.jsonl（严格 append-only），
+  // 独立轮询 job（jobs.start，默认 5s，复用宿主 job 机制——不新增裸定时器）检查
+  // 各 inbox，目标会话活跃（ctx.agents.get 命中）即投递（role:user 帧 + INBOX_GUARDRAIL），
+  // 非活跃则留存（水位不推进），激活后自然 drain。审计落 inboxDir/audit.jsonl。
+
+  const dshHome = cfg.inboxHome || join(process.env.DSH_HOME ?? join(homedir(), '.dsh'))
+  const inbox = createInboxService({ homeDir: dshHome, log, maxBytes: cfg.inboxMaxBytes })
+  const deferredThrottle = new Map() // sid → 上次 deliver-deferred 审计 ts（60s 节流）
+  const inboxMessageText = (msg) => {
+    const head = `[会话间消息｜${msg.kind}｜来自 ${msg.from}]`
+    return msg.ref ? `${head}\n${msg.text}\n（回复关联 ${msg.ref}）` : `${head}\n${msg.text}`
+  }
+
+  /** 单个 inbox tick：对每个 *.jsonl 增量读 → 活跃目标投递 + 水位推进；超限归档。 */
+  const inboxTick = async () => {
+    let files = []
+    try {
+      // 只扫会话 inbox 文件（<sid>.jsonl）：排除 audit.jsonl（025：审计文件非消息、
+      // 无水位——误扫会导致每 tick 全量读 + 超限被归档改名，审计链断裂）
+      files = readdirSync(inbox.inboxDir).filter(
+        (f) => f.endsWith('.jsonl') && !f.startsWith('.') && f !== AUDIT_FILE,
+      )
+    } catch { return } // 目录不存在：无消息
+    for (const f of files) {
+      const sid = f.slice(0, -'.jsonl'.length)
+      let got
+      try { got = inbox.readNew(sid) } catch { continue }
+      if (got.msgs.length === 0) {
+        if (got.size > cfg.inboxMaxBytes) {
+          try { inbox.archive(sid) } catch (err) { log.warn('inbox: 归档失败 (%s):', sid, err) }
+        }
+        continue
+      }
+      // 文件按目标会话分文件：该文件全部消息投给 sid 这一个目标
+      const agent = ctx.agents.get(sid)
+      if (!agent) {
+        // 非活跃：留存不丢（水位不推进）；审计节流 60s/目标
+        const last = deferredThrottle.get(sid) || 0
+        if (Date.now() - last > 60_000) {
+          deferredThrottle.set(sid, Date.now())
+          inbox.emit({ action: 'deliver-deferred', to: sid, msgId: got.msgs[0].id, pending: got.msgs.length })
+        }
+        continue
+      }
+      deferredThrottle.delete(sid)
+      let deliveredAll = true
+      for (const msg of got.msgs) {
+        try {
+          agent.followup({
+            id: randomUUID(),
+            role: 'user',
+            content: [{ type: 'text', text: `${INBOX_GUARDRAIL}\n${inboxMessageText(msg)}` }],
+            source: { kind: 'plugin', plugin: name, form: 'session-inbox' },
+          })
+          inbox.emit({ action: 'deliver-ok', to: sid, msgId: msg.id, from: msg.from, kind: msg.kind })
+        } catch (err) {
+          deliveredAll = false
+          inbox.emit({ action: 'deliver-fail', to: sid, msgId: msg.id, note: String(err) })
+          break // 停止推进：剩余消息下轮自然再试（不设重试循环）
+        }
+      }
+      if (deliveredAll) {
+        // 全有全无推进：全部成功才推进水位（部分失败重投 = 宁可重复不可丢）
+        inbox.advanceWater(sid, { offset: got.offset, lastReadId: got.msgs[got.msgs.length - 1].id })
+      }
+      if (got.size > cfg.inboxMaxBytes) {
+        try { inbox.archive(sid) } catch (err) { log.warn('inbox: 归档失败 (%s):', sid, err) }
+      }
+    }
+  }
+
+  const inboxToolDefs = [
+    {
+      name: 'session_send',
+      description: 'Send a message to another DSH session through the session inbox channel (20260902-020). Use for cross-session coordination/notification (e.g. tell another running session to pause work, ask it a question, or reply to its earlier message). Args: to (target session id, session-<uuid>), text (message content), kind (notice|request|coordinate, default notice), ref (optional: original msg id when replying). The from id is taken from the calling session server-side (not client-supplied). If the target session is inactive the message stays in its inbox and is delivered automatically when it becomes active. Recipient treats the message as a normal user message and decides on its own.',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: 'Target session id, e.g. session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
+          text: { type: 'string', description: 'Message text (plain text only, no command semantics)' },
+          kind: { type: 'string', enum: ['notice', 'request', 'coordinate'], description: 'Message kind (default notice)' },
+          ref: { type: 'string', description: 'Original msg id when replying to a received session-inbox message' },
+        },
+        required: ['to', 'text'],
+        additionalProperties: false,
+      },
+      output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+      async execute(args, exec) {
+        if (!cfg.inboxEnabled) return '会话间 inbox 已禁用（配置 inboxEnabled=false）。'
+        const from = String(exec?.agent?.id || '') // M4：from 服务端取自调用会话，不接受客户端传参
+        if (!from) return '❌ 无法确定当前会话 id（from 缺失），拒绝发送。'
+        const registry = scanSessionRegistry(inbox.sessionsDir) // N1：持久化注册表为校验源
+        const r = inbox.send({ to: args.to, from, text: args.text, kind: args.kind, ref: args.ref, registry })
+        if (!r.ok) {
+          if (r.reason === 'format') return `❌ 目标会话 id 格式非法（${r.to}）：应为 session-<uuid>。`
+          if (r.reason === 'unknown') return `❌ 目标会话不在持久化注册表（${r.to}，磁盘 ~/.dsh/sessions 无此会话）。用会话上下文里的真实会话 id 重试。`
+          return `❌ 发送失败: ${r.reason}`
+        }
+        return `✅ 已写入会话 ${r.msg.to} 的 inbox（msg ${r.msg.id}）。目标活跃时 ~5s 内送达；非活跃则留存，激活后自动送达。`
+      },
+    },
+  ]
+
+  if (cfg.inboxEnabled) {
+    // 工具注册
+    try {
+      const disposersInboxTools = inboxToolDefs.map((def) => ctx.tools.register(def))
+      disposers.push(...disposersInboxTools)
+    } catch (err) {
+      log.warn('inbox: 工具注册失败（忽略）:', err)
+    }
+    // 轮询 job（宿主 job 机制——004 纪律：不新增裸定时器）
+    try {
+      const inboxController = new AbortController()
+      const inboxJobIdRef = { value: undefined }
+      const inboxJobId = jobs.start({
+        kind: 'dsh-relay-inbox',
+        label: '会话间 inbox 轮询',
+        run: () => {
+          const done = (async () => {
+            const signal = inboxController.signal
+            const sleep = (ms) => new Promise((resolve) => {
+              const t = setTimeout(resolve, ms)
+              signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+            })
+            while (!signal.aborted) {
+              await sleep((cfg.inboxPollSecs ?? 5) * 1000)
+              if (signal.aborted) return
+              try {
+                await inboxTick()
+              } catch (err) {
+                log.warn('inbox: 轮询 tick 失败:', err)
+              }
+            }
+          })().then(
+            () => ({ status: 'completed' }),
+            (err) => ({ status: 'failed', detail: String(err) }),
+          )
+          return {
+            cancel: () => inboxController.abort(),
+            done,
+            readOutput: () => '',
+          }
+        },
+      })
+      inboxJobIdRef.value = inboxJobId
+    } catch (err) {
+      log.warn('inbox: 轮询 job 启动失败（忽略）:', err)
+    }
+  }
+
   // ---- /relay 命令（网页命令输入行：罗列未回复诉求/状态） ----
 
   const commands = ctx.get('commands')
@@ -820,6 +978,6 @@ export function apply(ctx, config = {}) {
     requests.dispose()
     store.flush()
   })
-  try { testHooks.set(ctx, { dispatch, store, requests, boundSessionFor, pushInbound }) } catch { /* 测试钩子失败不影响运行 */ }
+  try { testHooks.set(ctx, { dispatch, store, requests, boundSessionFor, pushInbound, inboxTick }) } catch { /* 测试钩子失败不影响运行 */ }
   log.info('dsh-relay loaded（状态文件 %s）', statePath)
 }

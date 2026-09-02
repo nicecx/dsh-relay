@@ -54,6 +54,7 @@ const config = {
   imessagePollSecs: 5,
   emailPollSecs: 20,
   statePath: join(dir, 'state.json'),
+  inboxEnabled: false, // inbox 轮询 job 由 test/inbox.test.mjs 单独覆盖
   channels: {
     imessage: { enabled: true, handle: '' }, // 未配置 → 不启动
     email: { enabled: false },
