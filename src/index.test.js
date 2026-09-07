@@ -440,9 +440,10 @@ t('imessage: 安全守卫——通配/全放行白名单被拒绝', () => {
   // 空 handle + 空 extraHandles → handles 空，configured 应 false（通道不启动）
   const ch = createImessageChannel({ handle: '', extraHandles: [], chatScope: '' }, deps)
   assert.equal(ch.configured(), false, '未配置白名单不启动')
-  // 合法具体身份不抛错
+  // 合法具体身份不抛错（configured() 含 process.platform==='darwin'——CI ubuntu 上为 false，
+  // 2026-09-07 CI 修复：断言平台感知）
   const ok = createImessageChannel({ handle: 'you@msn.com', extraHandles: ['+8613800000000'], chatScope: '' }, deps)
-  assert.equal(ok.configured(), true, '具体白名单正常配置')
+  assert.equal(ok.configured(), process.platform === 'darwin', '具体白名单配置（darwin 上正常启用）')
 })
 
 t('imessage: buildFindChatSql 空 scope 收全部会话（手机号+msn 都能找到）', () => {
