@@ -8,12 +8,19 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+// macOS 专属套件（TCC/osascript/chat.db/iMessage）仅在 darwin 运行——
+// CI（ubuntu）跑它们必失败（历史 fail 通知源：08-29 起每次 push 的 test workflow failure）
+const isMac = process.platform === 'darwin'
 const suites = [
   ['单元测试（路由/语义/编号/存储/脱敏/通道解析）', 'src/index.test.js'],
   ['dry-run 集成（审批/提问//relay 命令）', 'src/dryrun.test.js'],
   ['apply 冒烟（插件装载/监听注册）', 'src/apply.smoke.js'],
-  ['imessage poll dry-run（真实 chat.db 只读 + 重建竞态）', 'test/imessage-poll.dryrun.mjs'],
-  ['环境自检（只读：TCC/osascript/buddy/活性；--send 才真实发送）', 'test/env-check.mjs'],
+  ...(isMac
+    ? [
+        ['imessage poll dry-run（真实 chat.db 只读 + 重建竞态）', 'test/imessage-poll.dryrun.mjs'],
+        ['环境自检（只读：TCC/osascript/buddy/活性；--send 才真实发送）', 'test/env-check.mjs'],
+      ]
+    : []),
 ]
 
 let failed = 0
